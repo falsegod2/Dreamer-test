@@ -5,33 +5,23 @@ import argparse
 import ruamel.yaml as yaml
 import pathlib
 import sys
-import tool_own
 from datetime import datetime
 import os
-from minedojo.sim import MineDojoSim
-import envs.wrappers as wrappers
+
+from parallel import Parallel, Damy
+from torch import distributions as torchd
+import functools
+
+# 自定义模块
 import tool_own
 import model_own
 import reward_own
-from parallel import Parallel, Damy
-from torch import distributions as torchd
 import exploration as expl
-import functools
 
 os.environ["MUJOCO_GL"] = "osmesa"
 sys.path.append(str(pathlib.Path(__file__).parent))
 
 to_np = lambda x: x.detach().cpu().numpy()
-
-def count_steps(folder):
-    """
-    length - 1是该episode包含的实际环境步数
-    返回的是所有episode加起来的环境步数
-    episode是一个agent从环境中初始到死亡的过程
-    """
-    return sum(int(str(n).split("-")[-1][:-4]) - 1 for n in folder.glob("*.npz"))
-
-
 
 class LS_Imagine(nn.Module):
     def __init__(self, obs_space, act_space, config, logger, dataset):
@@ -193,7 +183,7 @@ def main(config):
     config.traindir.mkdir(parents=True, exist_ok=True)
     config.evaldir.mkdir(parents=True, exist_ok=True)
     
-    step = count_steps(config.traindir)
+    step = tool_own.count_steps(config.traindir)
     logger = tool_own.Logger(config, logdir, config.action_repeat * step)
     print(f"日志将保存在: {logdir}")
 
@@ -235,9 +225,8 @@ def main(config):
 
     """ --- 获取任务详细规格 (MineDojo Specs) --- """
     suite, task = config.task.split("_", 1)
-    from envs.tasks import get_specs
     task_kwargs = dict(target_item=config.target_item)
-    task_id, task_specs, sim_specs = get_specs(task, **task_kwargs)
+    task_id, task_specs, sim_specs = tool_own.get_specs(task, **task_kwargs)
 
     """ --- 将任务参数注入Config --- """
     config.episode_max_steps = task_specs['terminal_specs']['max_steps']
@@ -272,7 +261,7 @@ def main(config):
     3. 预填充 Replay Buffer (Prefill Phase)
     """
     if not config.offline_traindir:
-        prefill = max(0, config.prefill - count_steps(config.traindir))
+        prefill = max(0, config.prefill - tool_own.count_steps(config.traindir))
         print(f"Prefill dataset ({prefill} steps).")
 
         # --- 定义随机策略 (Random Actor) ---

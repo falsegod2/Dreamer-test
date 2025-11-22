@@ -3,30 +3,22 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import copy
-import logging
-import math
-
-from os.path import join as pjoin
-
-import torch
-import torch.nn as nn
-import numpy as np
-
-from torch.nn import CrossEntropyLoss, Dropout, Softmax, Linear, Conv2d, LayerNorm
-from torch.nn.modules.utils import _pair
-from scipy import ndimage
-from affordance_map.networks.swin_transformer_unet_skip_expand_decoder_sys import SwinTransformerSys, MultimodalSwinTransformerSys
 import os
 import copy
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
+import math
 import random
-
-from PIL import Image, ImageDraw, ImageFont
+import logging
 from datetime import datetime
-from torch import nn
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn import CrossEntropyLoss, Dropout, Softmax, Linear, Conv2d, LayerNorm
+import matplotlib.pyplot as plt
+from PIL import Image, ImageDraw, ImageFont
+
+from affordance_map.networks.swin_transformer_unet_skip_expand_decoder_sys import SwinTransformerSys, MultimodalSwinTransformerSys
 
 import networks
 import tools
@@ -35,6 +27,7 @@ logger = logging.getLogger(__name__)
 to_np = lambda x: x.detach().cpu().numpy()
 
 def probability_to_bool(input_tensor, jump_prob=1.0):
+    """根据概率将张量转换为布尔掩码"""
     random_tensor = torch.rand_like(input_tensor)
     random_mask = random_tensor < jump_prob # bool
     
@@ -44,7 +37,10 @@ def probability_to_bool(input_tensor, jump_prob=1.0):
     return bool_tensor
 
 class RewardEMA:
-    """running mean and std"""
+    """
+    运行时的奖励均值和标准差估计 (Exponential Moving Average)
+    用于标准化奖励信号，使训练更稳定
+    """
 
     def __init__(self, device, alpha=1e-2):
         self.device = device
@@ -54,13 +50,14 @@ class RewardEMA:
     def __call__(self, x, ema_vals):
         flat_x = torch.flatten(x.detach())
         x_quantile = torch.quantile(input=flat_x, q=self.range)
-        # this should be in-place operation
+        # 原地更新 ema_vals
         ema_vals[:] = self.alpha * x_quantile + (1 - self.alpha) * ema_vals
         scale = torch.clip(ema_vals[1] - ema_vals[0], min=1.0)
         offset = ema_vals[0]
         return offset.detach(), scale.detach()
 
 class MCUnet(nn.Module):
+    """多模态 U-Net，用于处理图像和文本特征"""
     def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False):
         super(MCUnet, self).__init__()
         self.num_classes = num_classes
@@ -87,12 +84,14 @@ class MCUnet(nn.Module):
                                 heads=config.MODEL.HEADS)
 
     def forward(self, x, p):
+        # 如果是灰度图，转为 3 通道
         if x.size()[1] == 1:
             x = x.repeat(1,3,1,1)
         logits = self.swin_unet(x, p)
         return logits
 
     def load_from(self, config):
+        """加载预训练权重，包含针对性的键名处理"""
         pretrained_path = config.MODEL.PRETRAIN_CKPT
         if pretrained_path is not None:
             print("pretrained_path:{}".format(pretrained_path))
