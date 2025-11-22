@@ -127,5 +127,6 @@ if __name__ == "__main__":
         'Synapse': trainer_synapse,
         'Minecraft': trainer_minecraft
         }
+        
     
     trainer[dataset_name](args, net, args.output_dir)

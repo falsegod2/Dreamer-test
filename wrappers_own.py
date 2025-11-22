@@ -6,7 +6,11 @@ import cv2
 from datetime import datetime
 from typing import Dict
 import numpy as np
-
+import torch
+import gym.spaces as spaces
+import copy
+from collections import OrderedDict
+from minedojo.sim.wrappers.fast_reset import FastResetWrapper
 
 def name_match(target_name, obs_name):
     return target_name.replace(" ", "_") == obs_name.replace(" ", "_")
@@ -320,4 +324,456 @@ class MinedojoSuccessWrapper(Wrapper):
 
 
 class ClipWrapper(Wrapper):
+    def __init__(self, env, clip, prompts=None, dense_reward=.01, smoothing=1, target_object='log', **kwargs):
+        super().__init__(env)
+        self.clip = clip # ClipReward
+        self.wrapper_name = "ClipWrapper"
+
+        assert prompts is not None
+        self.dense_reward = dense_reward
+        self.smoothing = smoothing
+
+        # --- 任务流 ---
+        self.task_prompts = prompts
+        self.task_buffer = None
+        self.task_clip_state = (None, None) # (past_frames, text_feats)
+        self.task_last_score = 0
+
+        # --- 探索流 ---
+        self.expl_prompts = [f"Explore the widest possible area to find {target_object}"]
+        self.expl_buffer = None
+        self.expl_clip_state = (None, None) # (past_frames, text_feats)
+        self.expl_last_score = 0
+        
+    def reset(self, **kwargs):
+        # 缓存文本特征text_feats ，重置帧缓冲区past_frames 
+        self.task_clip_state = None, self.task_clip_state[1]
+        self.expl_clip_state = None, self.expl_clip_state[1]
+
+        self.task_buffer = None
+        self.expl_buffer = None
+        self.task_last_score = 0
+        self.expl_last_score = 0
+
+        obs = self.env.reset(**kwargs)
+        obs['intrinsic'] = 0.0
+        obs['score'] = 0.0
+
+        return obs
     
+    def step(self, action):
+        obs, reward, done, info = self.env.step(action)
+
+        # --- 1. 处理任务奖励流 (注入到 obs) ---
+        if len(self.task_prompts) > 0:
+            logits, self.task_clip_state = self.clip.get_logits(obs, self.task_prompts, self.task_clip_state)
+            logits = logits.detach().cpu()
+
+            self.task_buffer = self._insert_buffer(self.task_buffer, logits[:1])
+            score = self._get_score()
+
+            #agent只会因为“比上一步做得更好”而获得内在奖励
+            if score > self.task_last_score:
+                obs['intrinsic'] = self.dense_reward * score
+                self.task_last_score = score
+            else:
+                obs['intrinsic'] = 0.0
+
+            obs['score'] = self.dense_reward * score
+
+        else:
+            obs['intrinsic'] = 0.0
+            obs['score'] = 0.0
+
+        # --- 2. 处理探索奖励流 (注入到 info) ---
+        if len(self.expl_prompts) > 0:
+            logits, self.expl_clip_state = self.clip.get_logits(obs, self.expl_prompts, self.expl_clip_state)
+            logits = logits.detach().cpu()
+
+            self.expl_buffer = self._insert_buffer(self.expl_buffer, logits[:1])
+            expl_score = self._get_expl_score()
+
+            if expl_score > self.expl_last_score:
+                info['expl_intrinsic'] = self.dense_reward * expl_score
+                self.expl_last_score = expl_score
+            else:
+                info['expl_intrinsic'] = 0.0
+
+        else:
+            info['expl_intrinsic'] = 0.0
+
+        info["clip_score"] = obs['intrinsic']
+        info["clip_last_score"] = self.task_last_score
+        info["clip_dense_reward"] = self.dense_reward    
+
+        return obs, reward, done, info 
+
+    """
+    _get_score 和 _get_expl_score 计算的是buffer内分数的平均值，这使得奖励信号更平滑，不易突变。
+    并使用了一个硬编码的 sigmoid 函数 (1 / (1 + th.exp(1.2 * (21.8 - score))))。
+    这会将 logits 的平均值（原始值可能在 20-22 附近）“压扁”到一个 0 到 1 之间的概率值。
+        21.8是及格线
+        1.2是敏感度
+    """
+    def _get_score(self):
+        score = torch.mean(self.task_buffer)
+        return (1 / (1 + torch.exp(1.2 * (21.8 - score)))).item()
+    
+    def _get_expl_score(self):
+        score = torch.mean(self.expl_buffer)
+        return (1 / (1 + torch.exp(1.2 * (21.8 - score)))).item()
+
+
+    def _insert_buffer(self, task_buffer, logits):
+        """
+        将 logits 插入固定大小的 FIFO 缓冲区。
+        不使用原始的 logits，而是维护一个大小为 self.smoothing 的滑动窗口（FIFO 缓冲区）。
+        """
+        if task_buffer is None:
+            task_buffer = logits.unsqueeze(0)
+        elif task_buffer.shape[0] < self.smoothing:
+            task_buffer = torch.cat([task_buffer, logits.unsqueeze(0)], dim=0)
+        else:
+            task_buffer = torch.cat([task_buffer[1:], logits.unsqueeze(0)], dim=0)
+        return task_buffer
+
+
+class ConcentrationWrapper(Wrapper):
+    def __init__(self, env, concentration, prompts=None, dense_reward=0.01, mineclip_dense_reward=0.01, max_steps=1000, gaussian_reward_weight=1.0, **kwargs):
+        super().__init__(env)
+        self.concentration = concentration # ConcentrationReward
+        self.wrapper_name = "ConcentrationWrapper"
+
+        assert prompts is not None
+        self.prompt = prompts
+        self.dense_reward = dense_reward
+        self.mineclip_dense_reward = mineclip_dense_reward
+        self.gaussian_reward_weight = gaussian_reward_weight
+
+        self.episode = 0
+        self.steps = 0
+        self.last_score = 0
+
+        self.last_zoom_in_mineclip_score = 0
+        self.last_zoom_in_gaussian_score = 0
+
+        self.max_steps = max_steps
+
+    def reset(self, **kwargs):
+        self.episode += 1
+        self.steps = 0
+
+        self.last_score = 0
+        self.last_zoom_in_mineclip_score = 0
+        self.last_zoom_in_gaussian_score = 0
+        obs = self.env.reset(**kwargs)
+
+        score, zoom_in_prob, check_threshold = self.concentration.get_reward(obs, self.prompt, self.episode, self.steps)
+        zoomed_image, is_check = self.concentration.generate_zoom_in_frame()
+        if is_check:
+            mineclip_on_zoomed, gaussian_on_zoomed, zoom_in_prob_on_zoomed, is_zoomed, jump = self.concentration.compute_reward_on_zoomed_image()
+        else:
+            mineclip_on_zoomed, gaussian_on_zoomed, zoom_in_prob_on_zoomed, is_zoomed, jump = 0.0, 0.0, 0.0, False, False
+
+        obs['is_zoomed'] = is_zoomed
+        obs['jump'] = jump
+        obs['jumping_steps'] = self.max_steps
+        obs['accumulated_reward'] = 0.0
+        obs['is_calculated'] = False
+        obs['reward_on_zoomed'] = 0.0
+        obs['intrinsic_on_zoomed'] = 0.0
+        obs['score_on_zoomed'] = 0.0
+        obs['zoomed_image'] = zoomed_image
+
+        if score > self.last_score:
+            obs['intrinsic'] += self.dense_reward * score * self.gaussian_reward_weight
+            self.last_score = score
+
+        obs['score'] += self.dense_reward * score
+
+        if is_zoomed:
+            if gaussian_on_zoomed > self.last_score and gaussian_on_zoomed > self.last_zoom_in_gaussian_score:
+                obs['intrinsic_on_zoomed'] += self.dense_reward * gaussian_on_zoomed * self.gaussian_reward_weight
+                self.last_zoom_in_gaussian_score = gaussian_on_zoomed
+
+            obs['score_on_zoomed'] += self.dense_reward * gaussian_on_zoomed
+
+            if mineclip_on_zoomed > self.last_zoom_in_mineclip_score:
+                obs['intrinsic_on_zoomed'] += self.mineclip_dense_reward * mineclip_on_zoomed
+                self.last_zoom_in_mineclip_score = mineclip_on_zoomed
+
+            obs['score_on_zoomed'] += self.mineclip_dense_reward * mineclip_on_zoomed
+           
+        obs['heatmap'] = self.concentration.get_heatmap(is_zoomed=False)
+        if is_zoomed:
+            obs['heatmap_on_zoomed'] = self.concentration.get_heatmap(is_zoomed=True)
+        else:
+            obs['heatmap_on_zoomed'] = obs['heatmap']
+        
+        return obs
+    
+    def step(self, action):
+        self.steps += 1
+        obs, reward, done, info = self.env.step(action)
+
+        if len(self.prompt) > 0:
+            score, zoom_in_prob, check_threshold = self.concentration.get_reward(obs, self.prompt, self.episode, self.steps)
+            zoomed_image, is_check = self.concentration.generate_zoom_in_frame()
+            if is_check:
+                mineclip_on_zoomed, gaussian_on_zoomed, zoom_in_prob_on_zoomed, is_zoomed, jump = self.concentration.compute_reward_on_zoomed_image()
+            else:
+                mineclip_on_zoomed, gaussian_on_zoomed, zoom_in_prob_on_zoomed, is_zoomed, jump = 0.0, 0.0, 0.0, False, False
+            
+            obs['is_zoomed'] = is_zoomed
+            obs['jump'] = jump
+            obs['jumping_steps'] = self.max_steps
+            obs['accumulated_reward'] = 0.0
+            obs['is_calculated'] = False
+            obs['reward_on_zoomed'] = reward
+            obs['intrinsic_on_zoomed'] = 0.0
+            obs['score_on_zoomed'] = 0.0
+            obs['zoomed_image'] = zoomed_image
+
+            if score > self.last_score:
+                obs['intrinsic'] += self.dense_reward * score * self.gaussian_reward_weight
+                self.last_score = score
+
+            obs['score'] += self.dense_reward * score
+
+            if is_zoomed:
+                if gaussian_on_zoomed > self.last_score and gaussian_on_zoomed > self.last_zoom_in_gaussian_score:
+                    obs['intrinsic_on_zoomed'] += self.dense_reward * gaussian_on_zoomed * self.gaussian_reward_weight
+                    self.last_zoom_in_gaussian_score = gaussian_on_zoomed
+
+                obs['score_on_zoomed'] += self.dense_reward * gaussian_on_zoomed
+                
+                if mineclip_on_zoomed > info["clip_last_score"] and mineclip_on_zoomed > self.last_zoom_in_mineclip_score:
+                    self.mineclip_dense_reward = info["clip_dense_reward"]
+                    obs['intrinsic_on_zoomed'] += self.mineclip_dense_reward * mineclip_on_zoomed
+                    self.last_zoom_in_mineclip_score = mineclip_on_zoomed
+
+                obs['score_on_zoomed'] += self.mineclip_dense_reward * mineclip_on_zoomed
+
+            obs['heatmap'] = self.concentration.get_heatmap(is_zoomed=False)
+            if is_zoomed:
+                obs['heatmap_on_zoomed'] = self.concentration.get_heatmap(is_zoomed=True)
+            else:
+                obs['heatmap_on_zoomed'] = obs['heatmap']
+                
+        return obs, reward, done, info
+    
+
+BASIC_ACTIONS = {
+    "noop": dict(),
+    "attack": dict(attack=np.array(1)),
+    "turn_up": dict(camera=np.array([-10.0, 0.])),
+    "turn_down": dict(camera=np.array([10.0, 0.])),
+    "turn_left": dict(camera=np.array([0., -10.0])),
+    "turn_right": dict(camera=np.array([0., 10.0])),
+    "forward": dict(forward=np.array(1)),
+    "back": dict(back=np.array(1)),
+    "left": dict(left=np.array(1)),
+    "right": dict(right=np.array(1)),
+    "jump": dict(jump=np.array(1), forward=np.array(1)),
+    "use": dict(use=np.array(1)),
+}
+
+NOOP_ACTION = {
+    'camera': np.array([0., 0.]), 
+    'smelt': 'none', 
+    'craft': 'none', 
+    'craft_with_table': 'none', 
+    'forward': np.array(0), 
+    'back': np.array(0), 
+    'left': np.array(0), 
+    'right': np.array(0), 
+    'jump': np.array(0), 
+    'sneak': np.array(0), 
+    'sprint': np.array(0), 
+    'use': np.array(0), 
+    'attack': np.array(0), 
+    'drop': 0, 
+    'swap_slot': OrderedDict([('source_slot', 0), ('target_slot', 0)]), 
+    'pickItem': 0, 
+    'hotbar.1': 0, 
+    'hotbar.2': 0, 
+    'hotbar.3': 0, 
+    'hotbar.4': 0, 
+    'hotbar.5': 0, 
+    'hotbar.6': 0, 
+    'hotbar.7': 0, 
+    'hotbar.8': 0, 
+    'hotbar.9': 0,
+}
+
+class MinedojoLSImagineWrapper(Wrapper):
+    def __init__(self, env, repeat=1, sticky_attack=0, sticky_jump=10, pitch_limit=(-70, 70)):
+        super().__init__(env)
+        self.wrapper_name = "LSImagineWrapper"
+
+        self._noop_action = NOOP_ACTION
+        actions = self._insert_defaults(BASIC_ACTIONS)
+        self._action_names = tuple(actions.keys())
+        self._action_values = tuple(actions.values())
+
+        self.observation_space = spaces.Dict(
+            {
+                'image': spaces.Box(low=0, high=255, shape=(64, 64, 3), dtype=np.uint8),
+                'heatmap': spaces.Box(low=0, high=255, shape=(64, 64, 1), dtype=np.uint8),
+                'jump': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
+                'is_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
+                'is_calculated': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
+                'is_first': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
+                'is_last': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
+                'is_terminal': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
+                'reward_on_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                'intrinsic': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                'intrinsic_on_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                'score': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                'score_on_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                'jumping_steps': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                'accumulated_reward': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+            }
+        )
+
+        self.action_space = spaces.discrete.Discrete(len(BASIC_ACTIONS))
+        self.action_space.discrete = True
+        self._repeat = repeat
+        self._sticky_attack_length = sticky_attack
+        self._sticky_attack_counter = 0
+        self._sticky_jump_length = sticky_jump
+        self._sticky_jump_counter = 0
+        self._pitch_limit = pitch_limit
+        self._pitch = 0
+
+    def reset(self):
+        obs = self.env.reset()
+        obs["is_first"] = True
+        obs["is_last"] = False
+        obs["is_terminal"] = False
+        obs = self._obs(obs)
+
+        self._sticky_attack_counter = 0
+        self._sticky_jump_counter = 0
+        self._pitch = 0
+        return obs
+
+    def step(self, action):
+        action = copy.deepcopy(self._action_values[action])
+        action = self._action(action)
+        following = self._noop_action.copy()
+        for key in ("attack", "forward", "back", "left", "right"):
+            following[key] = action[key]
+        for act in [action] + ([following] * (self._repeat - 1)):
+            obs, reward, done, info = self.env.step(act)
+            if "error" in info:
+                done = True
+                break
+        obs["is_first"] = False
+        obs["is_last"] = bool(done)
+        obs["is_terminal"] = bool(info.get("is_terminal", info["real_done"]))
+        obs = self._obs(obs)
+
+        assert "pov" not in obs, list(obs.keys())
+
+        return obs, reward, done, info
+
+    def _obs(self, obs):
+        image = obs['rgb'] # 3 * H * W
+        image = image.transpose(1, 2, 0).astype(np.uint8) # H * W * 3
+        image = cv2.resize(image, (64, 64)) # 64 * 64 * 3
+
+        if 'zoomed_image' in obs:
+            zoomed_image = obs['zoomed_image'] # H * W * 3
+            zoomed_image = zoomed_image.astype(np.uint8) # H * W * 3
+            zoomed_image = cv2.resize(zoomed_image, (64, 64)) # 64 * 64 * 3
+        else:
+            zoomed_image = np.zeros_like(image)
+
+        heatmap = cv2.resize(obs['heatmap'] if 'heatmap' in obs else np.zeros((64, 64, 1)), (64, 64))
+        heatmap_on_zoomed = cv2.resize(obs['heatmap_on_zoomed'] if 'heatmap_on_zoomed' in obs else np.zeros((64, 64, 1)), (64, 64))
+        heatmap = np.clip(heatmap * 255, 0, 255).astype(np.uint8)
+        heatmap_on_zoomed = np.clip(heatmap_on_zoomed * 255, 0, 255).astype(np.uint8)
+
+        obs = {
+            'image': image,
+            'heatmap': heatmap,
+            'jump': obs['jump'] if 'jump' in obs else False,
+            'is_zoomed': obs['is_zoomed'] if 'is_zoomed' in obs else False,
+            'is_calculated': obs['is_calculated'] if 'is_calculated' in obs else False,
+            'is_first': obs['is_first'],
+            'is_last': obs['is_last'],
+            'is_terminal': obs['is_terminal'],
+            'reward_on_zoomed': obs['reward_on_zoomed'] if 'reward_on_zoomed' in obs else 0.0,
+            'intrinsic': obs['intrinsic'] if 'intrinsic' in obs else 0.0,
+            'intrinsic_on_zoomed': obs['intrinsic_on_zoomed'] if 'intrinsic_on_zoomed' in obs else 0.0,
+            'score': obs['score'] if 'score' in obs else 0.0,
+            'score_on_zoomed': obs['score_on_zoomed'] if 'score_on_zoomed' in obs else 0.0,
+            'jumping_steps': obs['jumping_steps'] if 'jumping_steps' in obs else 1000.0,
+            'accumulated_reward': obs['accumulated_reward'] if 'accumulated_reward' in obs else 1000.0,
+        }
+
+        if obs["is_zoomed"]:
+            obs["zoomed_image"] = zoomed_image
+            obs["heatmap_on_zoomed"] = heatmap_on_zoomed
+        else:
+            obs["zoomed_image"] = None
+            obs["heatmap_on_zoomed"] = None
+
+        
+        for key, value in obs.items():
+            if key in self.observation_space:
+                space = self.observation_space[key]
+                if not isinstance(value, np.ndarray):
+                    value = np.array(value)
+                assert (key, value, value.dtype, value.shape, space)
+        return obs
+
+    def _action(self, action):
+        if self._sticky_attack_length:
+            if action["attack"]:
+                self._sticky_attack_counter = self._sticky_attack_length
+            if self._sticky_attack_counter > 0:
+                action["attack"] = np.array(1)
+                action["jump"] = np.array(0)
+                self._sticky_attack_counter -= 1
+        if self._sticky_jump_length:
+            if action["jump"]:
+                self._sticky_jump_counter = self._sticky_jump_length
+            if self._sticky_jump_counter > 0:
+                action["jump"] = np.array(1)
+                action["forward"] = np.array(1)
+                self._sticky_jump_counter -= 1
+        if self._pitch_limit and action["camera"][0]:
+            lo, hi = self._pitch_limit
+            if not (lo <= self._pitch + action["camera"][0] <= hi):
+                action["camera"] = (0, action["camera"][1])
+            self._pitch += action["camera"][0]
+        return action
+
+
+    def _insert_defaults(self, actions):
+        actions = {name: action.copy() for name, action in actions.items()}
+        for key, default in self._noop_action.items():
+            for action in actions.values():
+                if key not in action:
+                    action[key] = default
+        return actions
+
+
+# Fast reset wrapper saves time but doesn't replace blocks
+# Occasionally doing a hard reset should prevent state shift
+class MinedojoSemifastResetWrapper(FastResetWrapper):
+
+    def __init__(self, *args, reset_freq=100, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reset_freq = reset_freq
+        self.reset_count = 0
+
+    def reset(self):
+        if self.reset_count < self.reset_freq:
+            self.reset_count += 1
+            return super().reset()
+        else:
+            self.reset_count = 0
+            return self.env.reset()
