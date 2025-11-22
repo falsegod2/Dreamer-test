@@ -352,9 +352,7 @@ def add_to_cache(cache, env_id, transition):
         for key, val in transition.items():
             if key not in cache[env_id]:
                 # 如果是新出现的 key，先用 0 填充之前的历史，保持长度一致
-                # (通常为了处理某些 info 字段在中间突然出现的情况)
-                current_len = len(next(iter(cache[env_id].values())))
-                cache[env_id][key] = [convert(0 * val)] * (current_len - 1)
+                cache[env_id][key] = [convert(0 * val)] 
                 cache[env_id][key].append(convert(val))
             else:
                 cache[env_id][key].append(convert(val))
@@ -699,7 +697,7 @@ def make_env(config, mode, id):
         # 创建基础环境
         env = _meta_task_make(meta_task_cls, **minedojo_specs)
         # 添加 Wrappers
-        env = _add_wrappers(env, task_id, log_dir=log_dir, **task_specs)
+        env = _add_wrappers(env, task_id,  **task_specs)
         return env
 
     # 构建环境
@@ -711,11 +709,11 @@ def make_env(config, mode, id):
     
     # 添加通用 OneHot 动作空间 Wrapper
     env = wrappers.OneHotAction(env)
-    """
+    
     env = wrappers.SelectAction(env, key="action")
     env = wrappers.UUID(env)
     env = wrappers.RewardObs(env)
-    """
+    
     return env
 
 # =============================================================================

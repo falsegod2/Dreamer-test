@@ -321,6 +321,25 @@ class MinedojoSuccessWrapper(Wrapper):
             return self._check_blocks_condition(condition_info, obs)
         else:
             raise NotImplementedError("{} terminal condition not implemented".format(condition_type))
+    
+    @staticmethod
+    def _check_item_condition(condition_info, obs):
+        return sum(quantity for name, quantity in zip(obs["inventory"]["name"], obs["inventory"]["quantity"]) 
+                   if name_match(condition_info["type"], name)) >= condition_info["quantity"]
+
+    @staticmethod
+    def _check_blocks_condition(condition_info, obs):
+        target = np.array(condition_info)
+        voxels = obs["voxels"]["block_name"].transpose(1,0,2)
+        for y in range(voxels.shape[0] - target.shape[0]):
+            for x in range(voxels.shape[1] - target.shape[1]):
+                for z in range(voxels.shape[2] - target.shape[2]):
+                    if np.all(voxels[y:y+target.shape[0],
+                                     x:x+target.shape[1],
+                                     z:z+target.shape[2]] == target):
+                        return True
+        return False
+
 
 
 class ClipWrapper(Wrapper):
