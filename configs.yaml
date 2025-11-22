@@ -78,6 +78,7 @@ defaults:
   # Training
   batch_size: 16
   batch_length: 32
+  #从磁盘加载 .npz episode 文件
   train_ratio: 512
   pretrain: 100
   model_lr: 1e-4

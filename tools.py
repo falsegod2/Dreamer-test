@@ -517,6 +517,8 @@ def sample_episodes(episodes, length, seed=0):
         p = np.array(
             [len(next(iter(episode.values()))) for episode in episodes.values()]
         )
+        #p是所有episode的第一个键的值的数组
+        #得到该episode占所有episode的比重
         p = p / np.sum(p)
         while size < length:
             episode = np_random.choice(list(episodes.values()), p=p)

@@ -17,6 +17,7 @@ harvest_log_in_plains:
     prompts: ["Cut a tree"]
     unet_checkpoint_dir: "affordance_map/finetune_unet/finetune_checkpoints/harvest_log_in_plains"
   reward_specs:
+  #每个任务只设置了一个最终的获取目标物品，并没有设置中间的获取物品对应的奖励
     item_rewards: 
       log:
         reward: 1

@@ -32,6 +32,17 @@ class RewardWrapper(Wrapper, ABC):
 
         return obs, reward, done, info
 
+    """
+    @abstractstaticmethod 的完整含义是：
+    “我（RewardWrapper）在此立下一个合同：所有想使用我的子类，
+    必须提供一个名为 _get_Ditem_count 的静态工具函数，这个函数必须接受 obs 和 item 两个参数。”
+
+    @abstractstaticmethod 这个“单行”装饰器是 Python 2 和早期 Python 3 的写法，现在已被弃用
+    # 现代 Python 的写法：
+    from abc import ABC, abstractmethod
+        @staticmethod
+        @abstractmethod
+    """
     @abstractstaticmethod
     def _get_item_count(obs, item):
         raise NotImplementedError()
