@@ -6,7 +6,7 @@ if [ -z "$1" ]; then
 fi
 
 export MINEDOJO_HEADLESS=1
-python expr.py \
+python expr_own.py \
     --configs minedojo \
     --task minedojo_$1 \
     --logdir ./logdir
