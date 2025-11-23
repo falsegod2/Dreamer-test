@@ -2,6 +2,7 @@ defaults:
 
   use_wandb: False
   wandb_key: None
+  resume_path: ''  # <--- 添加这一行
   logdir: null
   traindir: null
   evaldir: null

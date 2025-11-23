@@ -17,6 +17,8 @@ from torchvision.transforms import Normalize
 from datetime import datetime
 from bisect import insort
 from collections import defaultdict
+import psutil 
+import gc # 引入垃圾回收
 
 # 尝试导入 wandb，如果未安装则忽略
 try:
@@ -320,7 +322,10 @@ def load_episodes(directory, limit=None, reverse=True):
     if reverse:
         filenames = reversed(filenames)
 
-    for filename in filenames:
+    # 获取当前进程，用于监测内存
+    process = psutil.Process(os.getpid())
+                             
+    for i, filename in enumerate(filenames):
         try:
             with filename.open("rb") as f:
                 episode = np.load(f)
@@ -336,6 +341,16 @@ def load_episodes(directory, limit=None, reverse=True):
         # 计算步数 (长度 - 1)
         steps = len(episode["reward"]) - 1
         total_steps += steps
+
+        # --- 内存监控 ---
+        if i % 100 == 0: # 每加载 100 个文件检查一次，避免刷屏
+            # 获取当前 RAM 使用量 (GB)
+            mem_gb = process.memory_info().rss / (1024 ** 3)
+            print(f"已加载: {total_steps} 步 | 当前文件: {filename.stem} | RAM使用: {mem_gb:.2f} GB")
+            
+            # 强制进行垃圾回收，尝试释放无用内存
+            #gc.collect()
+        # -------------------------
         
         if limit and total_steps >= limit:
             break

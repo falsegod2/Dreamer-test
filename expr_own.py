@@ -171,12 +171,28 @@ def main(config):
         tool_own.enable_deterministic_run()
 
     """--- 配置路径结构 ---"""
+    '''
     logdir = pathlib.Path(config.logdir).expanduser()
     logdir = logdir / config.task / f'seed_{config.seed}'
     timestamp = datetime.now().strftime('%Y%m%dT%H%M%S')
     logdir = logdir / timestamp
+    '''
+    """--- 配置路径结构 ---"""
+    # [修改开始] 支持指定恢复路径
+    if hasattr(config, 'resume_path') and config.resume_path:
+        # 如果指定了 resume_path，直接使用该路径，不再生成新时间戳
+        logdir = pathlib.Path(config.resume_path).expanduser()
+        print(f" 检测到恢复模式，将直接使用现有目录: {logdir}")
+    else:
+        # 否则，按照原逻辑生成新时间戳
+        logdir = pathlib.Path(config.logdir).expanduser()
+        logdir = logdir / config.task / f'seed_{config.seed}'
+        timestamp = datetime.now().strftime('%Y%m%dT%H%M%S')
+        logdir = logdir / timestamp
+    # [修改结束]
     
     config.logdir = logdir
+
     config.traindir = config.traindir or logdir / "train_eps"
     config.evaldir = config.evaldir or logdir / "eval_eps"
     
@@ -204,6 +220,7 @@ def main(config):
     """ --- 加载离线数据路径 (如果有) ---"""
     directory = config.traindir
     train_eps = tool_own.load_episodes(directory, limit=config.dataset_size)
+    #train_eps 是驻留在内存中的巨大字典，包含了图像、动作、奖励等所有数据
 
     directory = config.offline_evaldir.format(**vars(config)) if config.offline_evaldir else config.evaldir
     eval_eps = tool_own.load_episodes(directory, limit=1)
