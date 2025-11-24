@@ -405,6 +405,7 @@ def save_episodes(directory, episodes):
             f1.seek(0)
             with filepath.open("wb") as f2:
                 f2.write(f1.read())
+                print(f"episode[{filename}-{length}.npz]结束，存入replay buffer中")
             del episode_copy
     return True
 
@@ -1109,6 +1110,8 @@ def save_colab(config,logdir):
     # ----------------------------------------------------------------
     # ### 配置云盘备份路径 ###
     # ----------------------------------------------------------------
+    #metric原目录
+    logdir_metric = logdir / "metrics.jsonl"
     # 云盘根目录
     drive_root = pathlib.Path("/content/drive/MyDrive/LS-Imagine-Backup")
     # 云盘目标文件夹 (保持结构 task/seed)
@@ -1117,6 +1120,7 @@ def save_colab(config,logdir):
     # 备份文件的最终路径 (我们使用固定文件名来实现覆盖)
     # 例如: /content/drive/.../seed_0/backup_latest.tar.gz
     drive_archive_path = drive_base / "backup_latest.tar.gz"
+    drive_archive_path_metric = drive_base / "metrics.jsonl"
     
     print(f"云盘备份目标文件: {drive_archive_path}")
     # ----------------------------------------------------------------
@@ -1128,6 +1132,7 @@ def save_colab(config,logdir):
         # 使用固定名字 latest_backup.tar.gz
         tmp_archive_name = "backup_tmp.tar.gz"
         local_tmp_path = f"/tmp/{tmp_archive_name}"
+
         
         print(f"正在打包目录: {logdir} -> {local_tmp_path}")
         
@@ -1145,12 +1150,14 @@ def save_colab(config,logdir):
         
         # 3. 上传 (覆盖) 到 Drive
         print(f"正在上传到云盘 (覆盖): {drive_archive_path}")
-        shutil.copy(local_tmp_path, drive_archive_path)
+        subprocess.run(["cp", logdir_metric, drive_archive_path], check=True)
+        subprocess.run(["cp", local_tmp_path, drive_archive_path_metric], check=True)
+        #shutil.copy(local_tmp_path, drive_archive_path)
         
         # 4. 清理临时文件
         os.remove(local_tmp_path)
         print("备份完成。")
         
-    except Exception as e:
+    except subprocess.CalledProcessError as e:
         print(f"备份过程出错: {e}")
         # --------------------------------------------------------------
