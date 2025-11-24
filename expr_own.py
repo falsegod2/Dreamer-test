@@ -222,7 +222,7 @@ def main(config):
     train_eps = tool_own.load_episodes(directory, limit=config.dataset_size)
     #train_eps 是驻留在内存中的巨大字典，包含了图像、动作、奖励等所有数据
 
-    directory = config.offline_evaldir.format(**vars(config)) if config.offline_evaldir else config.evaldir
+    directory = config.evaldir
     eval_eps = tool_own.load_episodes(directory, limit=1)
     """
     情景一：离线训练模式 (Offline Training)
@@ -287,7 +287,7 @@ def main(config):
     """
     3. 预填充 Replay Buffer (Prefill Phase)
     """
-    if not config.offline_traindir:
+    if not config.resume_path:
         prefill = max(0, config.prefill - tool_own.count_steps(config.traindir))
         print(f"Prefill dataset ({prefill} steps).")
 

@@ -343,7 +343,7 @@ def load_episodes(directory, limit=None, reverse=True):
         total_steps += steps
 
         # --- 内存监控 ---
-        if i % 100 == 0: # 每加载 100 个文件检查一次，避免刷屏
+        if i % 10 == 0: # 每加载 100 个文件检查一次，避免刷屏
             # 获取当前 RAM 使用量 (GB)
             mem_gb = process.memory_info().rss / (1024 ** 3)
             print(f"已加载: {total_steps} 步 | 当前文件: {filename.stem} | RAM使用: {mem_gb:.2f} GB")
