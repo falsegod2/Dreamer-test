@@ -413,6 +413,7 @@ def main(config):
         if current_time - last_backup_time >= BACKUP_INTERVAL:
             print(f"已过去 {(current_time - last_backup_time)/3600:.2f} 小时，开始执行云端备份...")
             tool_own.save_colab(config,logdir)
+            last_backup_time = current_time
         else:
             # 如果时间没到，跳过
             remaining_time = BACKUP_INTERVAL - (current_time - last_backup_time)

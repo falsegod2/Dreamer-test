@@ -1150,8 +1150,8 @@ def save_colab(config,logdir):
         
         # 3. 上传 (覆盖) 到 Drive
         print(f"正在上传到云盘 (覆盖): {drive_archive_path}")
-        subprocess.run(["cp", logdir_metric, drive_archive_path], check=True)
-        subprocess.run(["cp", local_tmp_path, drive_archive_path_metric], check=True)
+        subprocess.run(["cp", logdir_metric, drive_archive_path_metric], check=True)
+        subprocess.run(["cp", local_tmp_path, drive_archive_path], check=True)
         #shutil.copy(local_tmp_path, drive_archive_path)
         
         # 4. 清理临时文件
