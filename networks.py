@@ -13,11 +13,11 @@ import tools
 class RSSM(nn.Module):
     def __init__(
         self,
-        stoch=30,
-        deter=200,
-        hidden=200,
-        rec_depth=1,
-        discrete=False,
+        stoch=30,       # z_t: 随机状态的维度 (Stochastic) -> 代表对当前时刻的模糊理解
+        deter=200,      # h_t: 确定性状态的维度 (Deterministic) -> GRU的隐藏层，代表长期记忆
+        hidden=200,     # 神经网络中间层的单元数
+        rec_depth=1,    # GRU的层数
+        discrete=False, # 是否使用离散分布 (DreamerV3 通常用离散分布，更稳定)
         act="SiLU",
         norm=True,
         mean_act="none",
@@ -25,11 +25,13 @@ class RSSM(nn.Module):
         min_std=0.1,
         unimix_ratio=0.01,
         initial="learned",
-        num_actions=None,
-        embed=None,
+        # ... 其他参数主要用于配置激活函数、初始化等 ...
+        num_actions=None, # 动作空间大小
+        embed=None,       # 图像编码后的特征维度
         device=None,
     ):
         super(RSSM, self).__init__()
+        # ... 保存参数 ...
         self._stoch = stoch
         self._deter = deter
         self._hidden = hidden
@@ -41,11 +43,16 @@ class RSSM(nn.Module):
         self._std_act = std_act
         self._unimix_ratio = unimix_ratio
         self._initial = initial
-        self._num_actions = num_actions + 1
+        self._num_actions = num_actions + 1 # +1 是因为有时会填充一个空动作
         self._embed = embed
         self._device = device
 
         inp_layers = []
+        """
+        --- 1. 想象输入层 (Prior Network) ---
+        作用：处理 [上一步随机状态 z + 动作 a] -> 准备输入给 GRU
+        也就是：根据“现状”和“动作”，推测“变化”
+        """
         if self._discrete:
             inp_dim = self._stoch * self._discrete + num_actions + 1
         else:
@@ -54,11 +61,22 @@ class RSSM(nn.Module):
         if norm:
             inp_layers.append(nn.LayerNorm(self._hidden, eps=1e-03))
         inp_layers.append(act())
+    
+        #定义全连接层+归一化+激活函数
         self._img_in_layers = nn.Sequential(*inp_layers)
         self._img_in_layers.apply(tools.weight_init)
+
+        """
+        # --- 2. 核心记忆单元 (GRU Cell) ---
+        # 作用：更新长期记忆 h_t。 h_t = GRU(h_{t-1}, 变化输入)
+        """
         self._cell = GRUCell(self._hidden, self._deter, norm=norm)
         self._cell.apply(tools.weight_init)
 
+        """
+        # --- 3. 想象输出层 (Prior Output) ---
+        # 作用：基于 GRU 的记忆 h_t，预测下一步的随机状态 z_t (先验/闭眼猜)
+        """
         img_out_layers = []
         inp_dim = self._deter
         img_out_layers.append(nn.Linear(inp_dim, self._hidden, bias=False))
@@ -68,8 +86,14 @@ class RSSM(nn.Module):
         self._img_out_layers = nn.Sequential(*img_out_layers)
         self._img_out_layers.apply(tools.weight_init)
 
+        """
+        # --- 4. 观察输出层 (Posterior Output) ---
+        # 作用：基于 [记忆 h_t + 真实图像特征 embed]，修正随机状态 z_t (后验/睁眼看)
+        # 输入维度 = 记忆(deter) + 眼睛看到的(embed)
+        """
         obs_out_layers = []
         inp_dim = self._deter + self._embed
+        # ... 归一化和激活 ...
         obs_out_layers.append(nn.Linear(inp_dim, self._hidden, bias=False))
         if norm:
             obs_out_layers.append(nn.LayerNorm(self._hidden, eps=1e-03))
@@ -77,6 +101,11 @@ class RSSM(nn.Module):
         self._obs_out_layers = nn.Sequential(*obs_out_layers)
         self._obs_out_layers.apply(tools.weight_init)
 
+        """
+        # --- 5. 分布映射层 (Heads) ---
+        # 作用：把上面神经网络输出的 hidden features 映射成概率分布的参数 (logits 或 mean/std)
+        # 分别用于生成“想象的 z” (imgs_stat) 和 “观察到的 z” (obs_stat)
+        """
         if self._discrete:
             self._imgs_stat_layer = nn.Linear(
                 self._hidden, self._stoch * self._discrete
@@ -84,6 +113,7 @@ class RSSM(nn.Module):
             self._imgs_stat_layer.apply(tools.uniform_weight_init(1.0))
             self._obs_stat_layer = nn.Linear(self._hidden, self._stoch * self._discrete)
             self._obs_stat_layer.apply(tools.uniform_weight_init(1.0))
+        # ... 连续分布的处理 ...
         else:
             self._imgs_stat_layer = nn.Linear(self._hidden, 2 * self._stoch)
             self._imgs_stat_layer.apply(tools.uniform_weight_init(1.0))
@@ -96,8 +126,13 @@ class RSSM(nn.Module):
                 requires_grad=True,
             )
 
+    # =========================================================================
+    # 初始化函数
+    # =========================================================================
     def initial(self, batch_size):
+        # ... 初始化 h_0 ...
         deter = torch.zeros(batch_size, self._deter).to(self._device)
+        # ... 初始化 z_0 ...
         if self._discrete:
             state = dict(
                 logit=torch.zeros([batch_size, self._stoch, self._discrete]).to(
@@ -123,8 +158,17 @@ class RSSM(nn.Module):
             return state
         else:
             raise NotImplementedError(self._initial)
-
+        
+    # =========================================================================
+    # 核心功能1：观察序列 (Training 阶段用)
+    # =========================================================================
     def observe(self, embed, action, is_first, state=None):
+        """
+        输入：一整段视频的特征 (embed)、动作 (action)
+        输出：每一帧的后验状态 (post) 和先验状态 (prior)
+        """
+        # 维度变换：PyTorch RNN 通常要求 (Time, Batch, Channel)
+        # swap 把 (Batch, Time, ...) 变成 (Time, Batch, ...) 以便循环
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
         # (batch, time, ch) -> (time, batch, ch)
         embed, action, is_first = swap(embed), swap(action), swap(is_first)
@@ -137,13 +181,23 @@ class RSSM(nn.Module):
             (state, state),
         )
 
+        # 把维度换回来
         # (batch, time, stoch, discrete_num) -> (batch, time, stoch, discrete_num)
         post = {k: swap(v) for k, v in post.items()}
         prior = {k: swap(v) for k, v in prior.items()}
 
+        # post: 看了图之后的理解 (用于训练 Encoder/Decoder)
+        # prior: 没看图的预测 (用于训练 Dynamics Model，让它猜得更准)
         return post, prior
 
+    # =========================================================================
+    # 核心功能2：LS-Imagine 特有的 Zoom 观察
+    # =========================================================================
     def observe_zoomed(self, embed_zoomed, action_zoomed, is_first_zoomed, rely_post, rely_prior):
+        """
+        这是论文特有的。处理那些经过 Zoom-In (放大) 处理的“跳跃”数据。
+        逻辑和 observe 基本一样，但是它依赖于主分支的状态 (rely_post, rely_prior) 作为上下文。
+        """
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
         # (batch, time, ch) -> (time, batch, ch)
         embed_zoomed, action_zoomed, is_first_zoomed = swap(embed_zoomed), swap(action_zoomed), swap(is_first_zoomed)
@@ -165,36 +219,39 @@ class RSSM(nn.Module):
 
         return post_zoomed, prior_zoomed
 
+    # =========================================================================
+    # 核心功能3：纯想象 (Actor Training 阶段用)
+    # =========================================================================
     def imagine_with_action(self, action, state):
+        """
+        输入：当前状态 state，和一串计划要做的动作 action
+        输出：想象出的未来状态 prior
+        注意：这里没有 embed 输入，因为是“闭眼”想未来。
+        """
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
         assert isinstance(state, dict), state
         action = swap(action)
+        # 循环调用 img_step (只预测，不修正)
         prior = tools.static_scan(self.img_step, [action], state)
         prior = prior[0]
         prior = {k: swap(v) for k, v in prior.items()}
         return prior
 
-    def get_feat(self, state):
-        stoch = state["stoch"]
-        if self._discrete:
-            shape = list(stoch.shape[:-2]) + [self._stoch * self._discrete]
-            stoch = stoch.reshape(shape)
-        return torch.cat([stoch, state["deter"]], -1)
 
-    def get_dist(self, state, dtype=None):
-        if self._discrete:
-            logit = state["logit"]
-            dist = torchd.independent.Independent(
-                tools.OneHotDist(logit, unimix_ratio=self._unimix_ratio), 1
-            )
-        else:
-            mean, std = state["mean"], state["std"]
-            dist = tools.ContDist(
-                torchd.independent.Independent(torchd.normal.Normal(mean, std), 1)
-            )
-        return dist
 
+    # =========================================================================
+    # 原子操作 A：单步观察 (Posterior)
+    # =========================================================================
     def obs_step(self, prev_state, prev_action, embed, is_first, sample=True):
+        """
+        这一步发生了什么：
+        1. 此时时刻是 t。
+        2. 我有 t-1 时刻的状态 (prev_state) 和动作 (prev_action)。
+        3. 我看到了 t 时刻的真实图片特征 (embed)。
+        """
+        # 1. 检查是否是 Episode 的第一步
+        # 如果 is_first=True，说明上一步的状态是上一个回合的，不能用。
+        # 需要重置为 initial 状态 (全0)
         if prev_action is not None and prev_action.shape[-1] != self._num_actions:
             shape = prev_action.shape
             new_shape = list(shape[:-1]) + [1]
@@ -222,45 +279,103 @@ class RSSM(nn.Module):
                     val * (1.0 - is_first_r) + init_state[key] * is_first_r
                 )
 
+        # 2. 先做“闭眼预测” (Prior)
+        # 算出：基于历史，我认为现在应该是什么样？
         prior = self.img_step(prev_state, prev_action)
+        # 3. 融合“预测”和“真实所见”
+        # 把 [预测的记忆 deter] 和 [真实看到的 embed] 拼起来
         x = torch.cat([prior["deter"], embed], -1)
+        # 4. 通过神经网络，计算“睁眼修正”后的分布 (Posterior)
         # (batch_size, prior_deter + embed) -> (batch_size, hidden)
         x = self._obs_out_layers(x)
         # (batch_size, hidden) -> (batch_size, stoch, discrete_num)
-        stats = self._suff_stats_layer("obs", x)
+        stats = self._suff_stats_layer("obs", x) # 得到分布参数(logits)
+
+        # 5. 从分布中采样得到随机状态 z (stoch)
         if sample:
             stoch = self.get_dist(stats).sample()
         else:
             stoch = self.get_dist(stats).mode()
+        # post 包含：修正后的 z (stoch), 记忆 h (deter), 分布参数
         post = {"stoch": stoch, "deter": prior["deter"], **stats}
         return post, prior
-
+    
+    # =========================================================================
+    # 原子操作 B：单步想象 (Prior)
+    # =========================================================================
     def img_step(self, prev_state, prev_action, sample=True):
+        """
+        这一步发生了什么：
+        1. 仅根据 t-1 的状态和动作，推测 t 的状态。
+        2. 不看答案 (没有 embed)。
+        """
+        # 取出上一步的随机状态 z
         # (batch, stoch, discrete_num)
         prev_stoch = prev_state["stoch"]
         if self._discrete:
+            # 如果是离散分布，把它展平成一维向量
             shape = list(prev_stoch.shape[:-2]) + [self._stoch * self._discrete]
             # (batch, stoch, discrete_num) -> (batch, stoch * discrete_num)
             prev_stoch = prev_stoch.reshape(shape)
+
+        # 1. 准备输入：[上一步 z, 上一步 a]
         # (batch, stoch * discrete_num) -> (batch, stoch * discrete_num + action)
         x = torch.cat([prev_stoch, prev_action], -1)
         # (batch, stoch * discrete_num + action, embed) -> (batch, hidden)
         x = self._img_in_layers(x)
+
+        # 2. 更新长期记忆 GRU (h)
+        # 这里的 deter 就是 h
         for _ in range(self._rec_depth):  # rec depth is not correctly implemented
             deter = prev_state["deter"]
             # (batch, hidden), (batch, deter) -> (batch, deter), (batch, deter)
-            x, deter = self._cell(x, [deter])
+            x, deter = self._cell(x, [deter]) # x 是 GRU 的输出，deter 是新的 hidden state
             deter = deter[0]  # Keras wraps the state in a list.
+        
+        # 3. 预测当前的随机状态 z
         # (batch, deter) -> (batch, hidden)
         x = self._img_out_layers(x)
         # (batch, hidden) -> (batch_size, stoch, discrete_num)
-        stats = self._suff_stats_layer("ims", x)
+        stats = self._suff_stats_layer("ims", x) # "ims" 表示 imagination (想象)
+
         if sample:
             stoch = self.get_dist(stats).sample()
         else:
             stoch = self.get_dist(stats).mode()
         prior = {"stoch": stoch, "deter": deter, **stats}
         return prior
+
+
+    # =========================================================================
+    # 辅助功能
+    # =========================================================================
+    def get_feat(self, state):
+        """
+        把 h (deter) 和 z (stoch) 拼起来。
+        这是为了给下游的 Actor/Critic 网络提供完整的信息。
+        """
+        stoch = state["stoch"]
+        if self._discrete:
+            shape = list(stoch.shape[:-2]) + [self._stoch * self._discrete]
+            stoch = stoch.reshape(shape)
+        return torch.cat([stoch, state["deter"]], -1)
+
+    def get_dist(self, state, dtype=None):
+        """
+        把神经网络输出的 logits 转换成 PyTorch 的分布对象。
+        方便计算 entropy (熵) 或 log_prob (对数概率)。
+        """
+        if self._discrete:
+            logit = state["logit"]
+            dist = torchd.independent.Independent(
+                tools.OneHotDist(logit, unimix_ratio=self._unimix_ratio), 1
+            )
+        else:
+            mean, std = state["mean"], state["std"]
+            dist = tools.ContDist(
+                torchd.independent.Independent(torchd.normal.Normal(mean, std), 1)
+            )
+        return dist
 
     def get_stoch(self, deter):
         x = self._img_out_layers(deter)
@@ -299,11 +414,26 @@ class RSSM(nn.Module):
             std = std + self._min_std
             return {"mean": mean, "std": std}
 
+    # =========================================================================
+    # 损失函数
+    # =========================================================================
     def kl_loss(self, post, prior, free, dyn_scale, rep_scale):
+        """
+        计算 KL 散度 Loss。
+        目的：让“闭眼预测 (prior)”尽可能接近“睁眼观察 (post)”。
+        这样以后即使闭着眼 (Imagine)，也能对世界有准确的认知。
+        """
+        
         kld = torchd.kl.kl_divergence
+
+        # sg (stop gradient): 停止梯度传播
+        # Dreamer 算法通常使用这种技巧来分别优化 Representation 和 Dynamics
+        # Representation Loss: 让后验去接近先验（让观察更符合逻辑）
+        # Dynamics Loss: 让先验去接近后验（让预测更符合现实）
         dist = lambda x: self.get_dist(x)
         sg = lambda x: {k: v.detach() for k, v in x.items()}
 
+        # 计算两个分布之间的距离
         rep_loss = value = kld(
             dist(post) if self._discrete else dist(post)._dist,
             dist(sg(prior)) if self._discrete else dist(sg(prior))._dist,
@@ -312,9 +442,12 @@ class RSSM(nn.Module):
             dist(sg(post)) if self._discrete else dist(sg(post))._dist,
             dist(prior) if self._discrete else dist(prior)._dist,
         )
+
+        # Free bits: 如果误差小于 free (例如 1.0)，就不惩罚。防止模型坍塌。
         # this is implemented using maximum at the original repo as the gradients are not backpropagated for the out of limits.
         rep_loss = torch.clip(rep_loss, min=free)
         dyn_loss = torch.clip(dyn_loss, min=free)
+        # 加权求和
         loss = dyn_scale * dyn_loss + rep_scale * rep_loss
 
         return loss, value, dyn_loss, rep_loss

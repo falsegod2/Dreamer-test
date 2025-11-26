@@ -5,7 +5,7 @@ import numpy as np
 
 # 1. 读取数据
 data = []
-file_path = './load_metric/metrics_seed0.jsonl'  # 你的文件路径
+file_path = './load_metric/metrics_seed2_11_26_16_29.jsonl'  # 你的文件路径
 
 try:
     with open(file_path, 'r') as f:
