@@ -114,9 +114,12 @@ class LS_Imagine(nn.Module):
 
     def _train(self, data):
         metrics = {}
+        # _wm._train 返回的 metrics 字典里包含了 'loss'
         post, post_zoomed, context, mets = self._wm._train(data)
         metrics.update(mets)
-        # start = (post, post_zoomed)
+        # [获取 image_loss] 
+        # 这里的 mets 字典里包含了 'image_loss'
+        current_loss = mets.get('image_loss', 0.0)
 
         reward = lambda f, s, a: self._wm.heads["reward"](
             self._wm.dynamics.get_feat(s)
@@ -142,7 +145,22 @@ class LS_Imagine(nn.Module):
             self._wm.dynamics.get_feat(s)
         ).mean
 
-        metrics.update(self._task_behavior._train(post, post_zoomed, reward, intrinsic, jumping_steps, accumulated_reward, jump_indicator, is_end)[-1])
+        # [修改] 调用 _task_behavior._train 时传入 current_wm_loss
+        #源代码：metrics.update(self._task_behavior._train(post, post_zoomed, reward, intrinsic, jumping_steps, accumulated_reward, jump_indicator, is_end)[-1])
+        behavior_metrics = self._task_behavior._train(
+            post, 
+            post_zoomed, 
+            reward, 
+            intrinsic, 
+            jumping_steps, 
+            accumulated_reward, 
+            jump_indicator, 
+            is_end,
+            current_wm_loss=current_loss # [这里传入 image_loss]
+        )[-1]
+        
+        metrics.update(behavior_metrics)
+        
         if self._config.expl_behavior != "greedy":
             mets = self._expl_behavior.train(post, context, data)[-1]
             metrics.update({"expl_" + key: value for key, value in mets.items()})

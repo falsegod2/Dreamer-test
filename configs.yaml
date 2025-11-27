@@ -94,6 +94,14 @@ defaults:
   jump_prob: 0.7
   jump_prob_decay: 0.9997
   imag_horizon: 15
+  # [新增配置开始]
+  adaptive_horizon: True      # 是否开启动态调节
+  min_imag_horizon: 5         # 最小想象长度
+  max_imag_horizon: 25        # 最大想象长度
+  horizon_update_rate: 0.05   # 调节速率 alpha
+  # [新增配置结束]
+
+
   max_imag_sequences_num: 1024
   imag_gradient: 'dynamics'
   imag_gradient_mix: 0.0

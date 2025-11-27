@@ -557,6 +557,14 @@ class ImagBehavior(nn.Module):
         self._use_amp = True if config.precision == 16 else False
         self._config = config
         self.jump_prob = config.jump_prob
+        # 初始化动态长度
+        self.current_horizon = float(config.imag_horizon)
+
+        # 注册 buffer 记录 Image Loss 的移动平均值
+        # 这能保证断点续训时，平均值状态不会丢失
+        self.register_buffer('loss_moving_avg', torch.tensor(0.0)) 
+        self.has_initialized_ema = False
+
         self.gamma_sum = [(1 - self._config.discount ** (i + 1)) / (1 - self._config.discount) for i in range(self._config.episode_max_steps)]
         self.gamma_sum = torch.tensor(self.gamma_sum, dtype=torch.float32, device=config.device)
 
@@ -635,10 +643,25 @@ class ImagBehavior(nn.Module):
         accumulated_reward_predictor,
         jump_indicator,
         is_end,
+        current_wm_loss=None, # <--- 接收 image_loss
     ):
 
         self._update_slow_target()
         metrics = {}
+
+        # [执行调节]
+        if current_wm_loss is not None:
+            if torch.is_tensor(current_wm_loss):
+                val = current_wm_loss.item()
+            else:
+                val = current_wm_loss
+            self.update_horizon(val)
+            
+            # 记录到 metrics 以便观察
+            metrics['imag_horizon'] = self.current_horizon
+            metrics['loss_moving_avg'] = self.loss_moving_avg.item()
+        # 获取当前的整数长度
+        current_H = self.get_current_horizon_int()
 
         with tools.RequiresGrad(self.actor):
             with torch.cuda.amp.autocast(self._use_amp):
@@ -662,7 +685,9 @@ class ImagBehavior(nn.Module):
                 jump_record = torch.empty((0, state_num), device=self._config.device) # [0, N]
                 imag_action = torch.empty((0, state_num, action_dimension), device=self._config.device) # [0, N, xx]
 
-                for _ in range (self._config.imag_horizon - 1):
+                # [修改关键点] 将 self._config.imag_horizon 替换为 current_H
+                # 原代码: for _ in range (self._config.imag_horizon - 1):
+                for _ in range (current_H - 1):
                     checking_state = {} # [N, xx, xx]
                     for key, tensor in imag_state.items():
                         checking_state[key] = tensor[-1, :, ...]
@@ -735,11 +760,15 @@ class ImagBehavior(nn.Module):
                     new_state_after_jump, self.actor, 1
                 ) 
 
+                # [修改关键点] 最后的 _imagine 调用也要用 current_H
+                # 原代码: new_feat, new_state_sequence, new_action = self._imagine(..., self._config.imag_horizon)
                 new_feat, new_state_sequence, new_action = self._imagine(
-                    new_state_after_jump, self.actor, self._config.imag_horizon
+                    new_state_after_jump, self.actor, current_H
                 ) # [L, N, xx, xx]
 
-                new_jump_record = torch.zeros((self._config.imag_horizon, new_num), device=self._config.device) # [L, Y]
+                # [修改关键点] 这里的 zeros 初始化也要用 current_H
+                # 原代码: new_jump_record = torch.zeros((self._config.imag_horizon, new_num), ...)
+                new_jump_record = torch.zeros((current_H, new_num), device=self._config.device) # [L, Y]
 
                 for key, tensor in imag_state.items():
                     imag_state[key] = torch.cat((tensor, new_state_sequence[key]), dim=1) # [L, N+Y, xx, xx]
@@ -810,6 +839,44 @@ class ImagBehavior(nn.Module):
             metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
             metrics.update(self._value_opt(value_loss, self.value.parameters()))
         return imag_feat, imag_state, imag_action, weights, metrics
+
+    # 在 ImagBehavior 类中添加的方法
+    def update_horizon(self, current_loss):
+        """
+        基于 image_loss 趋势的动态调节器
+        """
+        # 1. 初始化 EMA (避免第一步震荡)
+        if not self.has_initialized_ema or self.loss_moving_avg == 0.0:
+            self.loss_moving_avg = torch.tensor(current_loss, device=self.loss_moving_avg.device)
+            self.has_initialized_ema = True
+            return
+
+        # 2. 更新移动平均 (EMA)
+        # decay=0.99 意味着我们看重长期的平均水平，不受单步波动影响
+        decay = getattr(self._config, 'loss_ema_decay', 0.99)
+        self.loss_moving_avg = decay * self.loss_moving_avg + (1 - decay) * current_loss
+
+        # 3. 计算“惊奇度” (偏差)
+        # diff < 0: 当前 Loss 比平均低 -> 模型表现超常 -> 增加 Horizon
+        # diff > 0: 当前 Loss 比平均高 -> 模型遇到困难 -> 减小 Horizon (刹车)
+        diff = current_loss - self.loss_moving_avg.item()
+        
+        # 4. 应用调节 (P-Control)
+        alpha = getattr(self._config, 'horizon_update_rate', 0.005)
+        
+        # 使用 tanh 或 clip 限制单次变化幅度，防止训练崩溃
+        update_step = -alpha * diff
+        update_step = max(-0.5, min(0.5, update_step)) 
+        
+        self.current_horizon += update_step
+        
+        # 5. 安全截断 (Clip)
+        min_h = getattr(self._config, 'min_imag_horizon', 5)
+        max_h = getattr(self._config, 'max_imag_horizon', 25)
+        self.current_horizon = max(min_h, min(self.current_horizon, max_h))
+
+    def get_current_horizon_int(self):
+        return int(round(self.current_horizon))
 
     def save_state_sequence(self, imag_feat, jump_record, freq=0.1):
         if random.random() > freq:
