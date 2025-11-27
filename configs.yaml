@@ -93,15 +93,14 @@ defaults:
   discount_lambda: 0.95
   jump_prob: 0.7
   jump_prob_decay: 0.9997
-  imag_horizon: 15
-  # [新增配置开始]
-  adaptive_horizon: True      # 是否开启动态调节
-  min_imag_horizon: 5         # 最小想象长度
-  max_imag_horizon: 25        # 最大想象长度
-  horizon_update_rate: 0.05   # 调节速率 alpha
-  # [新增配置结束]
 
+  # === 修改开始 ===
+  imag_horizon: 15          # 最终的最大想象长度
+  imag_horizon_min: 3       # 训练开始时的最小想象长度
+  imag_horizon_decay_steps: 500000 # 经过多少步训练后，长度达到最大值
+  # === 修改结束 ===
 
+  # ... (其他配置)
   max_imag_sequences_num: 1024
   imag_gradient: 'dynamics'
   imag_gradient_mix: 0.0

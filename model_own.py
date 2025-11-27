@@ -633,6 +633,24 @@ class ImagBehavior(nn.Module):
             self.register_buffer("ema_vals", torch.zeros((2,)).to(self._config.device))
             self.reward_ema = RewardEMA(device=self._config.device)
 
+    # 添加到 ImagBehavior 类中
+    def get_horizon(self, step):
+        """根据当前训练步数计算动态想象长度"""
+        if self._config.imag_horizon_decay_steps <= 0:
+            return self._config.imag_horizon
+            
+        # 线性增长计算
+        min_h = self._config.imag_horizon_min
+        max_h = self._config.imag_horizon
+        decay = self._config.imag_horizon_decay_steps
+        
+        # 计算比例 (0.0 到 1.0)
+        ratio = min(1.0, max(0.0, step / decay))
+        
+        # 线性插值并取整
+        current_horizon = int(min_h + (max_h - min_h) * ratio)
+        return current_horizon
+    
     def _train(
         self,
         start,
@@ -643,25 +661,17 @@ class ImagBehavior(nn.Module):
         accumulated_reward_predictor,
         jump_indicator,
         is_end,
-        current_wm_loss=None, # <--- 接收 image_loss
+        step=0, # <--- 1. 新增 step 参数
     ):
 
         self._update_slow_target()
         metrics = {}
 
-        # [执行调节]
-        if current_wm_loss is not None:
-            if torch.is_tensor(current_wm_loss):
-                val = current_wm_loss.item()
-            else:
-                val = current_wm_loss
-            self.update_horizon(val)
-            
-            # 记录到 metrics 以便观察
-            metrics['imag_horizon'] = self.current_horizon
-            metrics['loss_moving_avg'] = self.loss_moving_avg.item()
-        # 获取当前的整数长度
-        current_H = self.get_current_horizon_int()
+        # <--- 2. 计算当前的 horizon
+        current_horizon = self.get_horizon(step)
+        
+        # 记录一下当前的想象长度到日志，方便观察
+        metrics["imag_horizon_curr"] = float(current_horizon)
 
         with tools.RequiresGrad(self.actor):
             with torch.cuda.amp.autocast(self._use_amp):
@@ -685,9 +695,9 @@ class ImagBehavior(nn.Module):
                 jump_record = torch.empty((0, state_num), device=self._config.device) # [0, N]
                 imag_action = torch.empty((0, state_num, action_dimension), device=self._config.device) # [0, N, xx]
 
-                # [修改关键点] 将 self._config.imag_horizon 替换为 current_H
+                # <--- 3. 修改循环次数: 使用 current_horizon
                 # 原代码: for _ in range (self._config.imag_horizon - 1):
-                for _ in range (current_H - 1):
+                for _ in range (current_horizon - 1):
                     checking_state = {} # [N, xx, xx]
                     for key, tensor in imag_state.items():
                         checking_state[key] = tensor[-1, :, ...]
@@ -763,12 +773,10 @@ class ImagBehavior(nn.Module):
                 # [修改关键点] 最后的 _imagine 调用也要用 current_H
                 # 原代码: new_feat, new_state_sequence, new_action = self._imagine(..., self._config.imag_horizon)
                 new_feat, new_state_sequence, new_action = self._imagine(
-                    new_state_after_jump, self.actor, current_H
+                    new_state_after_jump, self.actor, current_horizon
                 ) # [L, N, xx, xx]
 
-                # [修改关键点] 这里的 zeros 初始化也要用 current_H
-                # 原代码: new_jump_record = torch.zeros((self._config.imag_horizon, new_num), ...)
-                new_jump_record = torch.zeros((current_H, new_num), device=self._config.device) # [L, Y]
+                new_jump_record = torch.zeros((current_horizon, new_num), device=self._config.device) # [L, Y]
 
                 for key, tensor in imag_state.items():
                     imag_state[key] = torch.cat((tensor, new_state_sequence[key]), dim=1) # [L, N+Y, xx, xx]
