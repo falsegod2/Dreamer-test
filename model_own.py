@@ -661,17 +661,27 @@ class ImagBehavior(nn.Module):
         accumulated_reward_predictor,
         jump_indicator,
         is_end,
-        step=0, # <--- 1. 新增 step 参数
+        current_wm_loss=None
     ):
 
         self._update_slow_target()
         metrics = {}
 
-        # <--- 2. 计算当前的 horizon
-        current_horizon = self.get_horizon(step)
+        # [执行调节]
+        if current_wm_loss is not None:
+            if torch.is_tensor(current_wm_loss):
+                val = current_wm_loss.item()
+            else:
+                val = current_wm_loss
+            self.update_horizon(val)
+            
+            # 记录到 metrics 以便观察
+            metrics['imag_horizon'] = self.current_horizon
+            metrics['loss_moving_avg'] = self.loss_moving_avg.item()
+
+        # [关键] 使用动态长度
+        H = self.get_current_horizon_int()
         
-        # 记录一下当前的想象长度到日志，方便观察
-        metrics["imag_horizon_curr"] = float(current_horizon)
 
         with tools.RequiresGrad(self.actor):
             with torch.cuda.amp.autocast(self._use_amp):
@@ -697,7 +707,7 @@ class ImagBehavior(nn.Module):
 
                 # <--- 3. 修改循环次数: 使用 current_horizon
                 # 原代码: for _ in range (self._config.imag_horizon - 1):
-                for _ in range (current_horizon - 1):
+                for _ in range (H - 1):
                     checking_state = {} # [N, xx, xx]
                     for key, tensor in imag_state.items():
                         checking_state[key] = tensor[-1, :, ...]
@@ -773,10 +783,10 @@ class ImagBehavior(nn.Module):
                 # [修改关键点] 最后的 _imagine 调用也要用 current_H
                 # 原代码: new_feat, new_state_sequence, new_action = self._imagine(..., self._config.imag_horizon)
                 new_feat, new_state_sequence, new_action = self._imagine(
-                    new_state_after_jump, self.actor, current_horizon
+                    new_state_after_jump, self.actor, H
                 ) # [L, N, xx, xx]
 
-                new_jump_record = torch.zeros((current_horizon, new_num), device=self._config.device) # [L, Y]
+                new_jump_record = torch.zeros((H, new_num), device=self._config.device) # [L, Y]
 
                 for key, tensor in imag_state.items():
                     imag_state[key] = torch.cat((tensor, new_state_sequence[key]), dim=1) # [L, N+Y, xx, xx]
