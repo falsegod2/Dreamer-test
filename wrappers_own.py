@@ -494,6 +494,12 @@ class ConcentrationWrapper(Wrapper):
         else:
             mineclip_on_zoomed, gaussian_on_zoomed, zoom_in_prob_on_zoomed, is_zoomed, jump = 0.0, 0.0, 0.0, False, False
 
+        """
+        # 强制不进行 zoom 计算,直接赋值为 False
+        """
+        is_zoomed = False
+        jump = False
+
         obs['is_zoomed'] = is_zoomed
         obs['jump'] = jump
         obs['jumping_steps'] = self.max_steps
@@ -542,6 +548,12 @@ class ConcentrationWrapper(Wrapper):
                 mineclip_on_zoomed, gaussian_on_zoomed, zoom_in_prob_on_zoomed, is_zoomed, jump = self.concentration.compute_reward_on_zoomed_image()
             else:
                 mineclip_on_zoomed, gaussian_on_zoomed, zoom_in_prob_on_zoomed, is_zoomed, jump = 0.0, 0.0, 0.0, False, False
+            
+            """
+            # 强制不进行 zoom 计算,直接赋值为 False
+            """
+            is_zoomed = False
+            jump = False
             
             obs['is_zoomed'] = is_zoomed
             obs['jump'] = jump

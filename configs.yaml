@@ -91,7 +91,7 @@ defaults:
   # Behavior.
   discount: 0.997
   discount_lambda: 0.95
-  jump_prob: 0.7
+  jump_prob: 0.0
   jump_prob_decay: 0.9997
   imag_horizon: 15
   max_imag_sequences_num: 1024
@@ -114,7 +114,7 @@ defaults:
 
 minedojo:
 
-  long_term_branch_weight: 1.0
+  long_term_branch_weight: 0.0
   gaussian_reward_weight: 1.0
   gaussian_sigma_weight: 0.5
 
