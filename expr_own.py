@@ -155,15 +155,6 @@ class LS_Imagine(nn.Module):
 
 def main(config):
     """
-    0.设置云盘保存时限
-    """
-    # 设置备份间隔为 2 小时 (单位：秒)
-    BACKUP_INTERVAL = 2 * 60 * 60 
-    # 初始化上次备份时间为当前时间 (或者设为0以强制并在第一次循环时备份)
-    last_backup_time = time.time()
-    print(f"云盘备份策略: 每 {BACKUP_INTERVAL/3600} 小时全量覆盖一次。")
-
-    """
     1. 全局设置与日志初始化 (Global Setup & Logging)
     """
     tool_own.set_seed_everywhere(config.seed)
@@ -404,22 +395,7 @@ def main(config):
             "agent_state_dict": agent.state_dict(),
             "optims_state_dict": tool_own.recursively_collect_optim_state_dict(agent),
         }
-        torch.save(items_to_save, logdir / "latest.pt")
-        
-        """
-        按时间间隔执行云端备份
-        """
-        current_time = time.time()
-        if current_time - last_backup_time >= BACKUP_INTERVAL:
-            print(f"已过去 {(current_time - last_backup_time)/3600:.2f} 小时，开始执行云端备份...")
-            tool_own.save_colab(config,logdir)
-            last_backup_time = current_time
-        else:
-            # 如果时间没到，跳过
-            remaining_time = BACKUP_INTERVAL - (current_time - last_backup_time)
-            # 可选：打印倒计时，或者保持安静
-            print(f"距离下次云端备份还有: {remaining_time/60:.1f} 分钟")
-            pass           
+        torch.save(items_to_save, logdir / "latest.pt")  
 
     
     """
