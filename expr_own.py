@@ -155,6 +155,16 @@ class LS_Imagine(nn.Module):
 
 def main(config):
     """
+    0.设置云盘保存时限 (由参数控制)
+    """
+    last_backup_time = time.time() # 初始化时间
+    
+    if config.enable_cloud_backup:
+        print(f"云盘备份已开启。策略: 每 {config.cloud_backup_interval/3600:.2f} 小时全量覆盖一次。")
+    else:
+        print("云盘备份已关闭 (本地模式)。")
+    
+    """
     1. 全局设置与日志初始化 (Global Setup & Logging)
     """
     tool_own.set_seed_everywhere(config.seed)
@@ -397,6 +407,24 @@ def main(config):
         }
         torch.save(items_to_save, logdir / "latest.pt")  
 
+        """
+        按时间间隔执行云端备份 (仅当开关开启时)
+        """
+        if config.enable_cloud_backup:
+            current_time = time.time()
+            # 使用 config.cloud_backup_interval 代替原来的 BACKUP_INTERVAL
+            if current_time - last_backup_time >= config.cloud_backup_interval:
+                print(f"已过去 {(current_time - last_backup_time)/3600:.2f} 小时，开始执行云端备份...")
+                
+                # 调用 tool_own.py 里的备份函数
+                try:
+                    tool_own.save_colab(config, logdir)
+                    last_backup_time = current_time
+                except Exception as e:
+                    print(f"警告：云端备份失败，但这不会影响训练主进程。错误信息: {e}")
+            else:
+                remaining_time = config.cloud_backup_interval - (current_time - last_backup_time)
+                print(f"距离下次云端备份还有: {remaining_time/60:.1f} 分钟") # 觉得吵可以注释掉
     
     """
     6. 清理与结束 (Cleanup)

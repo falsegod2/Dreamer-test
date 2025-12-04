@@ -3,6 +3,11 @@ defaults:
   use_wandb: False
   wandb_key: None
   resume_path: null  # <--- 添加这一行
+
+  # === 新增以下两行 ===
+  enable_cloud_backup: False   # 是否开启云盘备份 (默认为 False，本地跑的时候就不报错了)
+  cloud_backup_interval: 7200  # 备份间隔时间，单位为秒 (7200秒 = 2小时)
+
   logdir: null
   traindir: null
   evaldir: null
