@@ -4,9 +4,16 @@ defaults:
   wandb_key: None
   resume_path: null  # <--- 添加这一行
 
-  # === 新增以下两行 ===
+  # === colab云盘备份 ===
   enable_cloud_backup: False   # 是否开启云盘备份 (默认为 False，本地跑的时候就不报错了)
   cloud_backup_interval: 7200  # 备份间隔时间，单位为秒 (7200秒 = 2小时)
+
+  # --- Iso-Dream Configs ---
+  use_iso_dream: True       # 开关：设置为 True 开启双流架构
+  iso_inv_scale: 1.0         # 逆动力学 Loss 权重
+  dyn_stoch_z: 32            # Z分支(不可控)的随机维度
+  dyn_deter_z: 512           # Z分支(不可控)的GRU维度
+  iso_min_max_alpha: 0.0     # (可选) 方差约束权重，初期建议设为0先跑通
 
   logdir: null
   traindir: null

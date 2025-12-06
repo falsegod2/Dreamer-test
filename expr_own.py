@@ -65,8 +65,11 @@ class LS_Imagine(nn.Module):
                 self._train(next(self._dataset))
                 self._update_count += 1
                 self._metrics["update_count"] = self._update_count
+
+            # 2. 日志触发检查 (Logging Check)
             if self._should_log(step):
                 for name, values in self._metrics.items():
+                    # 重点：计算这段时间所有 Loss 的“平均值” (np.mean)
                     self._logger.scalar(name, float(np.mean(values)))
                     self._metrics[name] = []
                 if self._config.video_pred_log:
@@ -114,6 +117,7 @@ class LS_Imagine(nn.Module):
 
     def _train(self, data):
         metrics = {}
+        #世界模型训练
         post, post_zoomed, context, mets = self._wm._train(data)
         metrics.update(mets)
         # start = (post, post_zoomed)
@@ -142,6 +146,7 @@ class LS_Imagine(nn.Module):
             self._wm.dynamics.get_feat(s)
         ).mean
 
+        #行为学习
         metrics.update(self._task_behavior._train(post, post_zoomed, reward, intrinsic, jumping_steps, accumulated_reward, jump_indicator, is_end)[-1])
         if self._config.expl_behavior != "greedy":
             mets = self._expl_behavior.train(post, context, data)[-1]
@@ -365,6 +370,7 @@ def main(config):
             print("Start evaluation.")
             eval_policy = functools.partial(agent, training=False)
             
+            #这里的代理使用的是partial的
             tool_own.simulate(
                 eval_policy,
                 eval_envs,

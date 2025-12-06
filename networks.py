@@ -9,6 +9,22 @@ from torch import distributions as torchd
 
 import tools
 
+# --- [新增] 逆动力学预测头 ---
+class InverseHead(nn.Module):
+    def __init__(self, inp_dim, out_dim, layers, units, act=nn.SiLU):
+        super(InverseHead, self).__init__()
+        self._layers = nn.Sequential()
+        current_dim = inp_dim
+        for i in range(layers):
+            self._layers.add_module(f"linear_{i}", nn.Linear(current_dim, units))
+            self._layers.add_module(f"act_{i}", act())
+            current_dim = units
+        self._layers.add_module("out", nn.Linear(current_dim, out_dim))
+
+    def forward(self, feat_prev, feat_curr):
+        # 拼接前后两帧的特征 (Batch, T, Feat*2)
+        x = torch.cat([feat_prev, feat_curr], dim=-1)
+        return self._layers(x)
 
 class RSSM(nn.Module):
     def __init__(
@@ -29,6 +45,7 @@ class RSSM(nn.Module):
         num_actions=None, # 动作空间大小
         embed=None,       # 图像编码后的特征维度
         device=None,
+        action_free=False,  # <--- [新增] 标记是否为 Action-Free 分支
     ):
         super(RSSM, self).__init__()
         # ... 保存参数 ...
@@ -38,6 +55,7 @@ class RSSM(nn.Module):
         self._min_std = min_std
         self._rec_depth = rec_depth
         self._discrete = discrete
+        self._action_free = action_free  # <--- [记录]
         act = getattr(torch.nn, act)
         self._mean_act = mean_act
         self._std_act = std_act
@@ -53,10 +71,22 @@ class RSSM(nn.Module):
         作用：处理 [上一步随机状态 z + 动作 a] -> 准备输入给 GRU
         也就是：根据“现状”和“动作”，推测“变化”
         """
-        if self._discrete:
-            inp_dim = self._stoch * self._discrete + num_actions + 1
+        # --- [修正] 维度计算逻辑 ---
+        if self._action_free:
+            # Z分支 (不可控): 不接收动作，所以没有 num_actions，也没有 +1
+            if self._discrete:
+                inp_dim = self._stoch * self._discrete
+            else:
+                inp_dim = self._stoch
         else:
-            inp_dim = self._stoch + num_actions + 1
+            # S分支 (可控): 接收动作
+            # 必须加上 LS-Imagine 特有的 "+1" (因为 preprocess 里拼接了 extra dim)
+            if self._discrete:
+                inp_dim = self._stoch * self._discrete + (num_actions or 0) + 1
+            else:
+                inp_dim = self._stoch + (num_actions or 0) + 1
+        # -------------------------
+        
         inp_layers.append(nn.Linear(inp_dim, self._hidden, bias=False))
         if norm:
             inp_layers.append(nn.LayerNorm(self._hidden, eps=1e-03))
@@ -309,18 +339,27 @@ class RSSM(nn.Module):
         1. 仅根据 t-1 的状态和动作，推测 t 的状态。
         2. 不看答案 (没有 embed)。
         """
-        # 取出上一步的随机状态 z
-        # (batch, stoch, discrete_num)
-        prev_stoch = prev_state["stoch"]
+        # 1. 如果是离散状态，展平特征
         if self._discrete:
-            # 如果是离散分布，把它展平成一维向量
             shape = list(prev_stoch.shape[:-2]) + [self._stoch * self._discrete]
             # (batch, stoch, discrete_num) -> (batch, stoch * discrete_num)
             prev_stoch = prev_stoch.reshape(shape)
+        
+        # 2. [核心修改] 根据分支类型决定输入内容
+        if self._action_free:
+            # === Z 分支 (不可控) ===
+            # 强制忽略动作，只看上一时刻的状态
+            x = prev_stoch
+        else:
+            # === S 分支 (可控) ===
+            # 必须包含动作，否则无法预测位移
+            if prev_action is None:
+                # 这是一个防御性报错，帮你快速定位 Bug
+                raise ValueError("Error: Action-Conditioned RSSM requires a valid action input!")
+            
+            # 拼接: [State, Action]
+            x = torch.cat([prev_stoch, prev_action], -1)
 
-        # 1. 准备输入：[上一步 z, 上一步 a]
-        # (batch, stoch * discrete_num) -> (batch, stoch * discrete_num + action)
-        x = torch.cat([prev_stoch, prev_action], -1)
         # (batch, stoch * discrete_num + action, embed) -> (batch, hidden)
         x = self._img_in_layers(x)
 
@@ -447,7 +486,11 @@ class RSSM(nn.Module):
         # this is implemented using maximum at the original repo as the gradients are not backpropagated for the out of limits.
         rep_loss = torch.clip(rep_loss, min=free)
         dyn_loss = torch.clip(dyn_loss, min=free)
+        """
         # 加权求和
+        # 这个loss值能够同时更新生成post的Encoder
+          以及生成prior的Dynamics
+        """
         loss = dyn_scale * dyn_loss + rep_scale * rep_loss
 
         return loss, value, dyn_loss, rep_loss

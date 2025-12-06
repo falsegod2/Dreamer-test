@@ -911,7 +911,8 @@ def simulate(
         information = [{}] * len(envs)
     else:
         step, episode, done, length, obs, agent_state, _, information = state
-        
+    
+    
     while (steps and step < steps) or (episodes and episode < episodes):
         
         # --- 1. 环境重置 (Reset) ---

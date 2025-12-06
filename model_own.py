@@ -137,23 +137,78 @@ class WorldModel(nn.Module):
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()} # 'image': (64, 64, 3)
         self.encoder = networks.MultiEncoder(shapes, **config.encoder)
         self.embed_size = self.encoder.outdim
-        self.dynamics = networks.RSSM(
-            config.dyn_stoch,
-            config.dyn_deter,
-            config.dyn_hidden,
-            config.dyn_rec_depth,
-            config.dyn_discrete,
-            config.act,
-            config.norm,
-            config.dyn_mean_act,
-            config.dyn_std_act,
-            config.dyn_min_std,
-            config.unimix_ratio,
-            config.initial,
-            config.num_actions,
-            self.embed_size,
-            config.device,
-        )
+        # --- [修改] 核心：Iso-Dream 双流架构初始化 ---
+        if config.use_iso_dream:
+            print(f"🔥 WorldModel: 启用 Iso-Dream 双流架构 (Z-Stoch={config.dyn_stoch_z}, Z-Deter={config.dyn_deter_z})")
+            
+            # 1. 可控分支 (S) - Action Conditioned
+            # [关键] action_free=False, 且 num_actions 必须传
+            self.dynamics_s = networks.RSSM(
+                config.dyn_stoch, config.dyn_deter, config.dyn_hidden,
+                config.dyn_rec_depth, config.dyn_discrete, config.act,
+                config.norm, config.dyn_mean_act, config.dyn_std_act,
+                config.dyn_min_std, config.unimix_ratio, config.initial,
+                config.num_actions, self.embed_size, config.device,
+                action_free=False 
+            )
+            
+            # 2. 不可控分支 (Z) - Action Free
+            # [关键] action_free=True, 它的维度参数使用 config.dyn_..._z
+            self.dynamics_z = networks.RSSM(
+                config.dyn_stoch_z, config.dyn_deter_z, config.dyn_hidden,
+                config.dyn_rec_depth, config.dyn_discrete, config.act,
+                config.norm, config.dyn_mean_act, config.dyn_std_act,
+                config.dyn_min_std, config.unimix_ratio, config.initial,
+                config.num_actions, self.embed_size, config.device,
+                action_free=True 
+            )
+
+            # 3. 计算拼接后的总特征维度 (S + Z)
+            # S 分支维度
+            if config.dyn_discrete:
+                feat_s = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
+                feat_z = config.dyn_stoch_z * config.dyn_discrete + config.dyn_deter_z
+            else:
+                feat_s = config.dyn_stoch + config.dyn_deter
+                feat_z = config.dyn_stoch_z + config.dyn_deter_z
+            
+            self.feat_size = feat_s + feat_z
+            
+            # 4. 逆动力学头 (Inverse Dynamics) - 仅针对 S 分支
+            # 输入：S(t-1) + S(t) -> 预测：Action(t-1)
+            # 使用现有的 networks.MLP，省去定义新类
+            self.heads["inverse"] = networks.MLP(
+                feat_s * 2, # 输入维度
+                (config.num_actions,), # 输出维度
+                config.reward_head["layers"], 
+                config.units, config.act, config.norm,
+                dist="onehot" if hasattr(act_space, "n") else "normal",
+                outscale=1.0,
+                device=config.device,
+                name="Inverse"
+            )
+            
+            # [警告] 不要设置 self.dynamics！
+            # 这会强迫所有调用 self.dynamics 的旧代码（如 video_pred）报错，
+            # 提示你去修改它们，而不是悄无声息地算出错误结果。
+            self.dynamics = None 
+
+        else:
+            # === 原版单流逻辑 ===
+            self.dynamics = networks.RSSM(
+                config.dyn_stoch, config.dyn_deter, config.dyn_hidden,
+                config.dyn_rec_depth, config.dyn_discrete, config.act,
+                config.norm, config.dyn_mean_act, config.dyn_std_act,
+                config.dyn_min_std, config.unimix_ratio, config.initial,
+                config.num_actions, self.embed_size, config.device,
+                action_free=False
+            )
+            
+            if config.dyn_discrete:
+                self.feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
+            else:
+                self.feat_size = config.dyn_stoch + config.dyn_deter
+        # ----------------------------------------------------
 
         self.heads = nn.ModuleDict()
 
@@ -273,209 +328,325 @@ class WorldModel(nn.Module):
         )
 
     def _train(self, data_origin):
-        
-        data = self.preprocess(data_origin, zoomed=False)
-        data_zoomed = self.preprocess(data_origin, zoomed=True)
+            # 1. 预处理数据
+            data = self.preprocess(data_origin, zoomed=False)
+            data_zoomed = self.preprocess(data_origin, zoomed=True)
 
-        zoomed_num = torch.sum(data["is_zoomed"]).item()
-        calculated_num = torch.sum(data_zoomed["is_calculated"]).item()
+            zoomed_num = torch.sum(data["is_zoomed"]).item()
+            calculated_num = torch.sum(data_zoomed["is_calculated"]).item()
 
-        with tools.RequiresGrad(self):
-            with torch.cuda.amp.autocast(self._use_amp):
-                
-                embed = self.encoder(data)
-                embed_zoomed = self.encoder(data_zoomed)
+            with tools.RequiresGrad(self):
+                with torch.cuda.amp.autocast(self._use_amp):
+                    # Encoder 编码
+                    embed = self.encoder(data)
+                    embed_zoomed = self.encoder(data_zoomed)
 
-                # process original data
-                post, prior = self.dynamics.observe(
-                    embed, data["action"], data["is_first"]
-                )
-
-                kl_free = self._config.kl_free # 1.0
-                dyn_scale = self._config.dyn_scale # 0.5
-                rep_scale = self._config.rep_scale # 0.1
-
-                kl_loss_img, kl_value_img, dyn_loss_img, rep_loss_img = self.dynamics.kl_loss(
-                    post, prior, kl_free, dyn_scale, rep_scale
-                )
-
-                assert kl_loss_img.shape == embed.shape[:2], kl_loss_img.shape
-
-                preds = {}
-                for name, head in self.heads.items():
-                    # When processing original data, "jumping_steps" and "accumulated_reward" are not used
-                    if name == "jumping_steps" or name == "accumulated_reward":
-                        continue
-                    grad_head = name in self._config.grad_heads
-                    feat = self.dynamics.get_feat(post)
-                    feat = feat if grad_head else feat.detach()
-                    pred = head(feat)
+                    kl_free = self._config.kl_free
+                    dyn_scale = self._config.dyn_scale
+                    rep_scale = self._config.rep_scale
                     
-                    if type(pred) is dict:
-                        preds.update(pred)
-                    else:
-                        preds[name] = pred
+                    # 初始化 Loss 容器
+                    inv_loss = torch.tensor(0.0, device=self._config.device)
+
+                    # ===============================================================
+                    # Part A: 处理普通短视距数据 (Short-term / Normal Stream)
+                    # ===============================================================
+                    if self._config.use_iso_dream:
+                        # --- Iso-Dream 双流逻辑 ---
                         
-                losses = {}
-                for name, pred in preds.items():
-                    loss = -pred.log_prob(data[name])
-                    assert loss.shape == embed.shape[:2], (name, loss.shape)
-                    losses[name] = loss
-                    
-                scaled = {
-                    key: value * self._scales.get(key, 1.0)
-                    for key, value in losses.items()
-                }
+                        # 1. S分支 (可控): 输入 Action
+                        post_s, prior_s = self.dynamics_s.observe(
+                            embed, data["action"], data["is_first"]
+                        )
+                        # 2. Z分支 (不可控): Action 为 None
+                        post_z, prior_z = self.dynamics_z.observe(
+                            embed, None, data["is_first"]
+                        )
 
-                if zoomed_num > 0:
-                    # process zoomed data
-                    is_zoomed_indices = data["is_zoomed"].squeeze(-1).bool()
-                    is_calculated_mask = data["is_calculated"][is_zoomed_indices]
-                    embed_zoomed = embed_zoomed[is_zoomed_indices].unsqueeze(1)
-                    for key, value in data_zoomed.items():
-                        data_zoomed[key] = value[is_zoomed_indices].unsqueeze(1)
+                        # 3. 拼接特征 (用于 Decoder 和 Heads)
+                        feat_s = self.dynamics_s.get_feat(post_s)
+                        feat_z = self.dynamics_z.get_feat(post_z)
+                        feat = torch.cat([feat_s, feat_z], dim=-1)
 
-                    selected_post = dict()
-                    selected_prior = dict()
-                    
-                    for key, value in post.items():
-                        selected_post[key] = value[is_zoomed_indices].unsqueeze(1)
+                        # 4. 计算双流 KL Loss
+                        kl_loss_s, kl_value_s, dyn_loss_s, rep_loss_s = self.dynamics_s.kl_loss(
+                            post_s, prior_s, kl_free, dyn_scale, rep_scale
+                        )
+                        kl_loss_z, kl_value_z, dyn_loss_z, rep_loss_z = self.dynamics_z.kl_loss(
+                            post_z, prior_z, kl_free, dyn_scale, rep_scale
+                        )
+                        
+                        # 合并统计
+                        kl_loss_img = kl_loss_s + kl_loss_z
+                        kl_value_img = kl_value_s + kl_value_z
+                        dyn_loss_img = dyn_loss_s + dyn_loss_z
+                        rep_loss_img = rep_loss_s + rep_loss_z
 
-                    for key, value in prior.items():
-                        selected_prior[key] = value[is_zoomed_indices].unsqueeze(1)
+                        # 5. [关键] 逆动力学 Loss (Inverse Dynamics)
+                        # 仅使用 S 分支特征: (S_{t-1}, S_t) -> a_{t-1}
+                        feat_s_prev = feat_s[:, :-1]
+                        feat_s_curr = feat_s[:, 1:]
+                        # InverseHead 在 __init__ 中定义为 self.heads["inverse"]
+                        pred_action = self.heads["inverse"](feat_s_prev, feat_s_curr)
+                        
+                        # [修正] 剥离 Action 的 Mask 维度 (LS-Imagine 特有的第13维)
+                        # data["action"] shape: [B, T, 13] -> target: [B, T-1, 12]
+                        target_action = data["action"][:, :-1, :-1] 
+                        
+                        if self._config.actor["dist"] == "onehot":
+                            # 如果是 OneHot 分布，转换为索引计算 CrossEntropy
+                            target_idx = torch.argmax(target_action, dim=-1)
+                            # Flatten for CrossEntropy: (B*(T-1), A) vs (B*(T-1))
+                            inv_loss = F.cross_entropy(
+                                pred_action.reshape(-1, self._config.num_actions), 
+                                target_idx.reshape(-1)
+                            )
+                        else:
+                            inv_loss = F.mse_loss(pred_action, target_action)
 
-                    post_zoomed, prior_zoomed = self.dynamics.observe_zoomed(
-                        embed_zoomed, data_zoomed["action"], data_zoomed["is_first"], selected_post, selected_prior
-                    )
-                    
-                    kl_loss_jmp, kl_value_jmp, dyn_loss_jmp, rep_loss_jmp = self.dynamics.kl_loss(
-                        post_zoomed, prior_zoomed, kl_free, dyn_scale, rep_scale
-                    )
+                        # 6. 构造统一的 post 字典供 Behavior 使用
+                        # Z 分支的 Key 加上 'z_' 前缀，方便 ImagBehavior 拆包
+                        post = {**post_s}
+                        for k, v in post_z.items():
+                            post[f"z_{k}"] = v
 
-                    assert kl_loss_jmp.shape == embed_zoomed.shape[:2], kl_loss_jmp.shape
+                    else:
+                        # --- 原版单流逻辑 ---
+                        post, prior = self.dynamics.observe(
+                            embed, data["action"], data["is_first"]
+                        )
+                        feat = self.dynamics.get_feat(post)
+                        kl_loss_img, kl_value_img, dyn_loss_img, rep_loss_img = self.dynamics.kl_loss(
+                            post, prior, kl_free, dyn_scale, rep_scale
+                        )
 
-                    preds_zoomed = {}
+                    # --- 计算通用 Heads Loss (Decoder, Reward, etc.) ---
+                    preds = {}
                     for name, head in self.heads.items():
-                        grad_head_zoomed = name in self._config.grad_heads
+                        # 跳过特殊的 Heads
+                        if name in ["jumping_steps", "accumulated_reward", "inverse"]: 
+                            continue
+                        
+                        grad_head = name in self._config.grad_heads
+                        # feat 已经是拼接后的 S+Z (如果是 Iso-Dream)
+                        pred_feat = feat if grad_head else feat.detach()
+                        pred = head(pred_feat)
+                        
+                        if type(pred) is dict: preds.update(pred)
+                        else: preds[name] = pred
+                            
+                    losses = {}
+                    for name, pred in preds.items():
+                        loss = -pred.log_prob(data[name])
+                        losses[name] = loss
+                        
+                    scaled = {k: v * self._scales.get(k, 1.0) for k, v in losses.items()}
 
-                        if name == "jumping_steps" or name == "accumulated_reward":
+                    # ===============================================================
+                    # Part B: 处理跳跃数据 (Zoomed / Long-term Stream)
+                    # ===============================================================
+                    losses_zoomed = {}
+                    if zoomed_num > 0:
+                        # 1. 筛选 Zoomed 数据
+                        is_zoomed_indices = data["is_zoomed"].squeeze(-1).bool()
+                        is_calculated_mask = data["is_calculated"][is_zoomed_indices]
+                        
+                        # 筛选 Embed
+                        embed_zoomed = embed_zoomed[is_zoomed_indices].unsqueeze(1)
+                        # 筛选 Action 等
+                        for key, value in data_zoomed.items():
+                            data_zoomed[key] = value[is_zoomed_indices].unsqueeze(1)
+
+                        if self._config.use_iso_dream:
+                            # --- Iso-Dream Zoomed Logic ---
+                            
+                            # 2. 筛选 S 和 Z 的初始状态 (selected_post)
+                            sel_post_s = {k: v[is_zoomed_indices].unsqueeze(1) for k, v in post_s.items()}
+                            sel_prior_s = {k: v[is_zoomed_indices].unsqueeze(1) for k, v in prior_s.items()}
+                            
+                            sel_post_z = {k: v[is_zoomed_indices].unsqueeze(1) for k, v in post_z.items()}
+                            sel_prior_z = {k: v[is_zoomed_indices].unsqueeze(1) for k, v in prior_z.items()}
+
+                            # 3. 分别推演 Zoomed 状态
+                            post_zoom_s, prior_zoom_s = self.dynamics_s.observe_zoomed(
+                                embed_zoomed, data_zoomed["action"], data_zoomed["is_first"], 
+                                sel_post_s, sel_prior_s
+                            )
+                            # Z 分支: Action=None
+                            post_zoom_z, prior_zoom_z = self.dynamics_z.observe_zoomed(
+                                embed_zoomed, None, data_zoomed["is_first"], 
+                                sel_post_z, sel_prior_z
+                            )
+
+                            # 4. 计算 Zoomed KL Loss
+                            kl_s_z, _, dyn_s_z, rep_s_z = self.dynamics_s.kl_loss(
+                                post_zoom_s, prior_zoom_s, kl_free, dyn_scale, rep_scale
+                            )
+                            kl_z_z, _, dyn_z_z, rep_z_z = self.dynamics_z.kl_loss(
+                                post_zoom_z, prior_zoom_z, kl_free, dyn_scale, rep_scale
+                            )
+                            
+                            kl_loss_jmp = kl_s_z + kl_z_z
+                            dyn_loss_jmp = dyn_s_z + dyn_z_z
+                            rep_loss_jmp = rep_s_z + rep_z_z
+
+                            # 5. 准备特征用于 Zoomed Heads
+                            # (需要拼接 S+Z)
+                            feat_zoom_s = self.dynamics_s.get_feat(post_zoom_s)
+                            feat_zoom_z = self.dynamics_z.get_feat(post_zoom_z)
+                            feat_zoomed = torch.cat([feat_zoom_s, feat_zoom_z], dim=-1) # [Zoomed_N, 1, Feat]
+
+                            # 准备 "跳跃前" 的特征 (用于 jumping_steps 等预测)
+                            feat_base_s = self.dynamics_s.get_feat(sel_post_s)
+                            feat_base_z = self.dynamics_z.get_feat(sel_post_z)
+                            feat_before_zoom = torch.cat([feat_base_s, feat_base_z], dim=-1)
+                            
+                            # 合并 Zoomed Post 用于返回
+                            post_zoomed = {**post_zoom_s}
+                            for k, v in post_zoom_z.items(): post_zoomed[f"z_{k}"] = v
+
+                        else:
+                            # --- 原版单流 Zoomed Logic ---
+                            selected_post = {k: v[is_zoomed_indices].unsqueeze(1) for k, v in post.items()}
+                            selected_prior = {k: v[is_zoomed_indices].unsqueeze(1) for k, v in prior.items()}
+
+                            post_zoomed, prior_zoomed = self.dynamics.observe_zoomed(
+                                embed_zoomed, data_zoomed["action"], data_zoomed["is_first"], selected_post, selected_prior
+                            )
+                            
+                            kl_loss_jmp, _, dyn_loss_jmp, rep_loss_jmp = self.dynamics.kl_loss(
+                                post_zoomed, prior_zoomed, kl_free, dyn_scale, rep_scale
+                            )
+                            
                             feat_zoomed = self.dynamics.get_feat(post_zoomed)
                             feat_before_zoom = self.dynamics.get_feat(selected_post)
-                            feat_concat = torch.concat([feat_before_zoom, feat_zoomed], dim=-1)
 
-                            feat_concat = feat_concat if grad_head_zoomed else feat_concat.detach()
-                            pred_zoomed = head(feat_concat)
+                        # --- Zoomed Heads Loss 计算 ---
+                        preds_zoomed = {}
+                        for name, head in self.heads.items():
+                            grad_head_zoomed = name in self._config.grad_heads
 
-                        else:
-                            feat_zoomed = self.dynamics.get_feat(post_zoomed)
-                            feat_zoomed = feat_zoomed if grad_head_zoomed else feat_zoomed.detach()
-                            pred_zoomed = head(feat_zoomed)
+                            # 跳跃步数和累积奖励需要拼接 [Feature_t, Feature_{t+k}]
+                            if name == "jumping_steps" or name == "accumulated_reward":
+                                feat_concat = torch.concat([feat_before_zoom, feat_zoomed], dim=-1)
+                                feat_input = feat_concat if grad_head_zoomed else feat_concat.detach()
+                                pred_zoomed = head(feat_input)
                             
-                        if type(pred_zoomed) is dict:
-                            preds_zoomed.update(pred_zoomed)
-                        else:
-                            preds_zoomed[name] = pred_zoomed
-                              
-                    losses_zoomed = {}
-                    for name, pred in preds_zoomed.items():
-                        if name == 'jumping_steps' or name == 'accumulated_reward':
+                            # 其他 Head (如 Zoomed Decoder) 只需 Zoomed 特征
+                            else:
+                                # 过滤掉 inverse 头，它不需要在这里计算
+                                if name == "inverse": continue 
+                                feat_input = feat_zoomed if grad_head_zoomed else feat_zoomed.detach()
+                                pred_zoomed = head(feat_input)
+                                
+                            if type(pred_zoomed) is dict: preds_zoomed.update(pred_zoomed)
+                            else: preds_zoomed[name] = pred_zoomed
+                                
+                        for name, pred in preds_zoomed.items():
                             loss = -pred.log_prob(data_zoomed[name])
-                            loss *= is_calculated_mask
+                            # 只有计算过的才计入 Loss (Masking)
+                            if name == 'jumping_steps' or name == 'accumulated_reward':
+                                loss *= is_calculated_mask
+                            
                             if loss.shape[1] != 1:
                                 loss = loss.mean(dim=1, keepdim=True)
-                            assert loss.shape == embed_zoomed.shape[:2], (name, loss.shape)
                             losses_zoomed[name] = loss
                             
-                        else:
-                            loss = -pred.log_prob(data_zoomed[name])
-                            if loss.shape[1] != 1:
-                                loss = loss.mean(dim=1, keepdim=True)
-                            assert loss.shape == embed_zoomed.shape[:2], (name, loss.shape)
-                            losses_zoomed[name] = loss
+                        scaled_zoomed = {k: v * self._scales.get(k, 1.0) for k, v in losses_zoomed.items()}
+
+                    # ===============================================================
+                    # Part C: Loss 聚合与反向传播
+                    # ===============================================================
+                    if zoomed_num > 0:
+                        # 将 Normal 和 Zoomed 的 KL Loss 拼起来
+                        kl_loss = torch.cat((kl_loss_img.reshape(-1), kl_loss_jmp.reshape(-1)), dim=0)
+                        kl_value = torch.cat((kl_value_img.reshape(-1), torch.zeros_like(kl_loss_jmp).reshape(-1)), dim=0) # 简化 value
+                        dyn_loss = torch.cat((dyn_loss_img.reshape(-1), dyn_loss_jmp.reshape(-1)), dim=0)
+                        rep_loss = torch.cat((rep_loss_img.reshape(-1), rep_loss_jmp.reshape(-1)), dim=0)
+
+                        # 聚合 Scaled Losses
+                        scaled_img_sum = sum(scaled.values()).reshape(-1)
+                        scaled_jmp_sum = sum(scaled_zoomed.values()).reshape(-1)
+                        # Zoomed Loss 加权
+                        scaled_total = torch.cat((scaled_img_sum, scaled_jmp_sum * self._config.long_term_branch_weight), dim=0)
                         
-                    scaled_zoomed = {
-                        key: value * self._scales.get(key, 1.0)
-                        for key, value in losses_zoomed.items()
-                    }
+                        # 总 Loss = Scaled Losses + KL Loss + Inverse Loss
+                        model_loss = scaled_total + kl_loss
+                        
+                        # Inverse Loss 是标量，加到 mean 上或者广播
+                        model_loss = model_loss.mean() + inv_loss * self._config.iso_inv_scale
 
-                if zoomed_num > 0:
-                    kl_loss_img = kl_loss_img.reshape(-1, *kl_loss_img.shape[2:])
-                    kl_loss_jmp = kl_loss_jmp.reshape(-1, *kl_loss_jmp.shape[2:])
-                    kl_loss = torch.cat((kl_loss_img, kl_loss_jmp), dim=0)
+                    else:
+                        kl_loss = kl_loss_img
+                        kl_value = kl_value_img
+                        dyn_loss = dyn_loss_img
+                        rep_loss = rep_loss_img
+                        
+                        model_loss = sum(scaled.values()) + kl_loss
+                        model_loss = model_loss.mean() + inv_loss * self._config.iso_inv_scale
 
-                    kl_value_img = kl_value_img.reshape(-1, *kl_value_img.shape[2:])
-                    kl_value_jmp = kl_value_jmp.reshape(-1, *kl_value_jmp.shape[2:])
-                    kl_value = torch.cat((kl_value_img, kl_value_jmp), dim=0)
+                # 优化器更新
+                metrics = self._model_opt(model_loss, self.parameters())
 
-                    dyn_loss_img = dyn_loss_img.reshape(-1, *dyn_loss_img.shape[2:])
-                    dyn_loss_jmp = dyn_loss_jmp.reshape(-1, *dyn_loss_jmp.shape[2:])
-                    dyn_loss = torch.cat((dyn_loss_img, dyn_loss_jmp), dim=0)
-
-                    rep_loss_img = rep_loss_img.reshape(-1, *rep_loss_img.shape[2:])
-                    rep_loss_jmp = rep_loss_jmp.reshape(-1, *rep_loss_jmp.shape[2:])
-                    rep_loss = torch.cat((rep_loss_img, rep_loss_jmp), dim=0)
-
-                    scaled_img = sum(scaled.values()).reshape(-1, *sum(scaled.values()).shape[2:]) # [512]
-                    scaled_jmp = sum(scaled_zoomed.values()).reshape(-1, *sum(scaled_zoomed.values()).shape[2:]) # [N]
-                    scaled_sum = torch.cat((scaled_img, scaled_jmp * self._config.long_term_branch_weight), dim=0) # [512 + N]
-                    
-                    model_loss = scaled_sum + kl_loss
-
-                else:
-                    kl_loss = kl_loss_img
-                    kl_value = kl_value_img
-                    dyn_loss = dyn_loss_img
-                    rep_loss = rep_loss_img
-                    
-                    model_loss = sum(scaled.values()) + kl_loss
-
-            metrics = self._model_opt(torch.mean(model_loss), self.parameters())
-
-        metrics.update({f"{name}_loss": to_np(torch.mean(loss)) for name, loss in losses.items()})
-        if zoomed_num > 0:
-            metrics.update({f"zoomed_{name}_loss": to_np(torch.mean(loss)) for name, loss in losses_zoomed.items()})
-        metrics["kl_free"] = kl_free
-        metrics["dyn_scale"] = dyn_scale
-        metrics["rep_scale"] = rep_scale
-        metrics["dyn_loss"] = to_np(torch.mean(dyn_loss))
-        metrics["rep_loss"] = to_np(torch.mean(rep_loss))
-        metrics["kl"] = to_np(torch.mean(kl_value))
-        if zoomed_num > 0:
-            metrics["dyn_loss_img"] = to_np(torch.mean(dyn_loss_img))
-            metrics["dyn_loss_jmp"] = to_np(torch.mean(dyn_loss_jmp))
-            metrics["rep_loss_img"] = to_np(torch.mean(rep_loss_img))
-            metrics["rep_loss_jmp"] = to_np(torch.mean(rep_loss_jmp))
-        metrics["model_loss"] = to_np(torch.mean(model_loss))
-
-        with torch.cuda.amp.autocast(self._use_amp):
-            metrics["prior_ent"] = to_np(
-                torch.mean(self.dynamics.get_dist(prior).entropy())
-            )
-            metrics["post_ent"] = to_np(
-                torch.mean(self.dynamics.get_dist(post).entropy())
-            )
+            # ===============================================================
+            # Part D: Metrics 记录 (修正版)
+            # ===============================================================
+            # 1. 记录所有 Head 的 Loss (Decoder, Reward...)
+            metrics.update({f"{name}_loss": to_np(torch.mean(loss)) for name, loss in losses.items()})
+            
+            # 2. 记录 Zoomed Head 的 Loss
             if zoomed_num > 0:
-                metrics["prior_zoomed_ent"] = to_np(
-                    torch.mean(self.dynamics.get_dist(prior_zoomed).entropy())
+                metrics.update({f"zoomed_{name}_loss": to_np(torch.mean(loss)) for name, loss in losses_zoomed.items()})
+                
+                # --- [恢复] 详细记录长短期 Loss 分量 ---
+                # 这能帮你对比：模型是擅长一步步走(img)，还是擅长跳跃(jmp)
+                metrics["dyn_loss_img"] = to_np(torch.mean(dyn_loss_img))
+                metrics["rep_loss_img"] = to_np(torch.mean(rep_loss_img))
+                metrics["dyn_loss_jmp"] = to_np(torch.mean(dyn_loss_jmp))
+                metrics["rep_loss_jmp"] = to_np(torch.mean(rep_loss_jmp))
+                # ------------------------------------
+
+            # 3. 记录基础指标
+            metrics["kl_free"] = kl_free
+            metrics["dyn_scale"] = dyn_scale
+            metrics["rep_scale"] = rep_scale
+            metrics["dyn_loss"] = to_np(torch.mean(dyn_loss)) # 这是 img 和 jmp 的总平均
+            metrics["rep_loss"] = to_np(torch.mean(rep_loss))
+            metrics["kl"] = to_np(torch.mean(kl_value))
+            
+            # [新增] 记录逆动力学 Loss (监控 S 分支是否学到了动作)
+            metrics["inv_loss"] = inv_loss.item() if torch.is_tensor(inv_loss) else inv_loss
+
+            # 4. 计算并记录熵 (Entropy) - 用于监控后验坍塌
+            with torch.cuda.amp.autocast(self._use_amp):
+                if self._config.use_iso_dream:
+                    # Iso-Dream 模式下，主要监控 S 分支 (可控部分) 的熵
+                    # Z 分支通常方差较小，监控 S 更能反映 Agent 状态
+                    dist = self.dynamics_s.get_dist(post_s)
+                    # 如果你想看 Z 分支是否"死掉"了，也可以解开下面这行注释：
+                    # metrics["z_ent"] = to_np(torch.mean(self.dynamics_z.get_dist(post_z).entropy()))
+                else:
+                    dist = self.dynamics.get_dist(post)
+                    
+                metrics["post_ent"] = to_np(torch.mean(dist.entropy()))
+                
+                # Context 构造 (供 Plan2Explore 使用)
+                context = dict(
+                    embed=embed,
+                    feat=feat, # [关键] 传递拼接后的特征 (S+Z)
+                    kl=kl_value,
+                    postent=dist.entropy(),
                 )
-                metrics["post_zoomed_ent"] = to_np(
-                    torch.mean(self.dynamics.get_dist(post_zoomed).entropy())
-                )    
-            context = dict(
-                embed=embed,
-                feat=self.dynamics.get_feat(post),
-                kl=kl_value,
-                postent=self.dynamics.get_dist(post).entropy(),
-            )
 
-        post = {k: v.detach() for k, v in post.items()}
-
-        if zoomed_num > 0:
-            post_zoomed = {k: v.detach() for k, v in post_zoomed.items()}
-            return post, post_zoomed, context, metrics
-        else:
-            return post, None, context, metrics
-
+            # 5. 返回结果
+            post = {k: v.detach() for k, v in post.items()}
+            
+            if zoomed_num > 0:
+                post_zoomed = {k: v.detach() for k, v in post_zoomed.items()}
+                return post, post_zoomed, context, metrics
+            else:
+                return post, None, context, metrics
+        
     # this function is called during both rollout and training
     def preprocess(self, obs, zoomed=False):
         obs = obs.copy()
@@ -530,22 +701,69 @@ class WorldModel(nn.Module):
         data = self.preprocess(data, zoomed=False)
         embed = self.encoder(data)
 
-        states, _ = self.dynamics.observe(
-            embed[:6, :5], data["action"][:6, :5], data["is_first"][:6, :5]
-        )
-    
-        recon = self.heads["decoder"](self.dynamics.get_feat(states))["image"].mode()[
-            :6
-        ]
+        # === [修改] 适配 Iso-Dream 双流架构 ===
+        if self._config.use_iso_dream:
+            # 1. Observe (后验观测)
+            # S 分支 (可控, 有动作)
+            post_s, _ = self.dynamics_s.observe(
+                embed[:6, :5], data["action"][:6, :5], data["is_first"][:6, :5]
+            )
+            # Z 分支 (不可控, 无动作)
+            post_z, _ = self.dynamics_z.observe(
+                embed[:6, :5], None, data["is_first"][:6, :5]
+            )
+            
+            # 2. Reconstruction (重建)
+            feat_s = self.dynamics_s.get_feat(post_s)
+            feat_z = self.dynamics_z.get_feat(post_z)
+            feat = torch.cat([feat_s, feat_z], dim=-1)
+            recon = self.heads["decoder"](feat)["image"].mode()[:6]
 
-        reward_post = self.heads["reward"](self.dynamics.get_feat(states)).mode()[:6]
-        init = {k: v[:, -1] for k, v in states.items()}
-        prior = self.dynamics.imagine_with_action(data["action"][:6, 5:], init)
-        openl = self.heads["decoder"](self.dynamics.get_feat(prior))["image"].mode()
-        reward_prior = self.heads["reward"](self.dynamics.get_feat(prior)).mode()
-        model = torch.cat([recon[:, :5], openl], 1)
-        truth = data["image"][:6]
-        model = model
+            # 3. Imagine (开环预测)
+            # 这里的 init 状态取自 t=5 时刻的后验
+            init_s = {k: v[:, -1] for k, v in post_s.items()}
+            init_z = {k: v[:, -1] for k, v in post_z.items()}
+            
+            # S 分支推演 (输入后续动作)
+            prior_s = self.dynamics_s.imagine_with_action(data["action"][:6, 5:], init_s)
+            # Z 分支推演 (无动作，自动演化)
+            # 注意: imagine_with_action 内部调用 img_step，我们传入 None 动作即可
+            prior_z = self.dynamics_z.imagine_with_action(None, init_z) 
+            
+            # 4. Open-loop Prediction (解码预测)
+            feat_s_prior = self.dynamics_s.get_feat(prior_s)
+            feat_z_prior = self.dynamics_z.get_feat(prior_z)
+            # 注意: prior_z 的长度可能需要和 s 对齐 (通常是一样的，因为 scan 长度取决于输入列表)
+            # 但因为 z 传入的是 None，imagine_with_action 需要知道长度。
+            # 这是一个潜在 Bug 点。查看 networks.py 的 imagine_with_action:
+            # 它依赖 inputs 的长度。如果是 None，static_scan 不知道跑多少步。
+            
+            # [修正] 我们需要手动调用 static_scan 来处理 Z 分支的无动作推演
+            # 或者给 Z 传入一个长度正确但内容为 None 的列表
+            # 这里采用简便方法：构造一个 Dummy Action 列表给 Z，但在 img_step 里会被忽略
+            dummy_action = data["action"][:6, 5:] # 仅用于提供长度
+            prior_z = self.dynamics_z.imagine_with_action(dummy_action, init_z)
+            
+            feat_prior = torch.cat([self.dynamics_s.get_feat(prior_s), 
+                                    self.dynamics_z.get_feat(prior_z)], dim=-1)
+            
+            openl = self.heads["decoder"](feat_prior)["image"].mode()
+
+        else:
+            # === 原版单流逻辑 ===
+            states, _ = self.dynamics.observe(
+                embed[:6, :5], data["action"][:6, :5], data["is_first"][:6, :5]
+            )
+            recon = self.heads["decoder"](self.dynamics.get_feat(states))["image"].mode()[:6]
+            
+            init = {k: v[:, -1] for k, v in states.items()}
+            prior = self.dynamics.imagine_with_action(data["action"][:6, 5:], init)
+            openl = self.heads["decoder"](self.dynamics.get_feat(prior))["image"].mode()
+        
+        # === 后处理 (通用) ===
+        model = torch.cat([recon, openl], 1)
+        truth = data["image"][:6] + 0.5
+        model = model + 0.5
         error = (model - truth + 1.0) / 2.0
 
         return torch.cat([truth, model, error], 2)
@@ -933,27 +1151,53 @@ class ImagBehavior(nn.Module):
             return feats, states, actions
 
     def _jumpy(self, start, policy, horizon):
-        dynamics = self._world_model.dynamics
+        use_iso = self._config.use_iso_dream
+        dyn_s = self._world_model.dynamics_s if use_iso else self._world_model.dynamics
+        dyn_z = self._world_model.dynamics_z if use_iso else None
 
         def step(prev, _):
             state, _, _ = prev
-            feat = dynamics.get_feat(state)
+            
+            # === [修改] 获取特征 ===
+            if use_iso:
+                state_s = {k: v for k, v in state.items() if not k.startswith("z_")}
+                state_z = {k[2:]: v for k, v in state.items() if k.startswith("z_")}
+                feat = torch.cat([dyn_s.get_feat(state_s), dyn_z.get_feat(state_z)], dim=-1)
+            else:
+                feat = dyn_s.get_feat(state)
+            
             inp = feat.detach()
             action = policy(inp).sample()
 
+            # 构造 Jump Action (最后一位设为 1)
             new_action = torch.zeros(action.shape[0], action.shape[1] + 1).to(action.device)
-            new_action[:, -1] = 1
-            succ = dynamics.img_step(state, new_action)
+            new_action[:, -1] = 1 # Jump Flag
+            
+            # === [修改] 双流推演 ===
+            if use_iso:
+                # S 分支: 执行 Jump (输入 new_action)
+                succ_s = dyn_s.img_step(state_s, new_action)
+                # Z 分支: 执行 Rollout (忽略动作)
+                # 注意: 这里 Z 只是演化一步，时间上对应 S 的一步 Jump (Delta t)。
+                # 理想情况下 Z 应该 rollout 多步，但为了对齐 Batch 维度，我们暂且让 Z 也 "跳" 一步 (网络会学会适应这种跨度)
+                succ_z = dyn_z.img_step(state_z, None)
+                
+                succ = {**succ_s}
+                for k, v in succ_z.items(): succ[f"z_{k}"] = v
+            else:
+                succ = dyn_s.img_step(state, new_action)
+                
             return succ, feat, action
         
         succ, feats, actions = tools.static_scan(
             step, [torch.arange(horizon)], (start, None, None)
         )
+        
+        # ... (后续打包代码保持不变，succ 已经是处理好的字典了) ...
         states = {k: torch.cat([start[k][None], v[:-1]], 0) for k, v in succ.items()}
 
         if horizon == 1:
-            for k, v in succ.items():
-                succ[k] = v.squeeze(0)
+            for k, v in succ.items(): succ[k] = v.squeeze(0)
             feats = feats.squeeze(0)
             actions = actions.squeeze(0)
             return feats, succ, actions
