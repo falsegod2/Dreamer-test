@@ -89,12 +89,53 @@ class LS_Imagine(nn.Module):
             latent = action = None
         else:
             latent, action = state
+        
         obs = self._wm.preprocess(obs)
         embed = self._wm.encoder(obs)
-        latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
-        if self._config.eval_state_mean:
-            latent["stoch"] = latent["mean"]
-        feat = self._wm.dynamics.get_feat(latent)
+
+        # === [修改] 适配 Iso-Dream 双流架构 ===
+        if self._config.use_iso_dream:
+            # 1. 初始化或拆分状态
+            if latent is None:
+                latent_s = None
+                latent_z = None
+            else:
+                latent_s = {k: v for k, v in latent.items() if not k.startswith("z_")}
+                latent_z = {k[2:]: v for k, v in latent.items() if k.startswith("z_")}
+
+            # 2. 分别执行 obs_step
+            # S 分支 (可控): 输入 action
+            latent_s, _ = self._wm.dynamics_s.obs_step(
+                latent_s, action, embed, obs["is_first"]
+            )
+            # Z 分支 (不可控): action 为 None (或被忽略)
+            latent_z, _ = self._wm.dynamics_z.obs_step(
+                latent_z, None, embed, obs["is_first"]
+            )
+
+            # 3. 处理 eval_state_mean (评估时使用均值代替采样)
+            if self._config.eval_state_mean:
+                latent_s["stoch"] = latent_s["mean"]
+                latent_z["stoch"] = latent_z["mean"]
+
+            # 4. 打包回混合状态 (供下一次迭代使用)
+            latent = {**latent_s}
+            for k, v in latent_z.items():
+                latent[f"z_{k}"] = v
+            
+            # 5. 提取特征 (使用刚刚在 WorldModel 添加的通用方法)
+            feat = self._wm.get_feat(latent)
+
+        else:
+            # === 原版单流逻辑 ===
+            latent, _ = self._wm.dynamics.obs_step(
+                latent, action, embed, obs["is_first"]
+            )
+            if self._config.eval_state_mean:
+                latent["stoch"] = latent["mean"]
+            feat = self._wm.dynamics.get_feat(latent)
+        # =======================================
+
         if not training:
             actor = self._task_behavior.actor(feat)
             action = actor.mode()
@@ -104,30 +145,33 @@ class LS_Imagine(nn.Module):
         else:
             actor = self._task_behavior.actor(feat)
             action = actor.sample()
+            
         logprob = actor.log_prob(action)
         latent = {k: v.detach() for k, v in latent.items()}
         action = action.detach()
+        
         if self._config.actor["dist"] == "onehot_gumble":
             action = torch.one_hot(
                 torch.argmax(action, dim=-1), self._config.num_actions
             )
+            
         policy_output = {"action": action, "logprob": logprob}
         state = (latent, action)
         return policy_output, state
 
     def _train(self, data):
         metrics = {}
-        #世界模型训练
         post, post_zoomed, context, mets = self._wm._train(data)
         metrics.update(mets)
-        # start = (post, post_zoomed)
 
+        # [修改] 使用 self._wm.get_feat(s) 替代 self._wm.dynamics.get_feat(s)
+        # 这样就能自动处理 Iso-Dream 的混合状态了
         reward = lambda f, s, a: self._wm.heads["reward"](
-            self._wm.dynamics.get_feat(s)
+            self._wm.get_feat(s) 
         ).mode()
 
         intrinsic = lambda f, s, a: self._wm.heads["intrinsic"](
-            self._wm.dynamics.get_feat(s)
+            self._wm.get_feat(s)
         ).mode() 
 
         jumping_steps = lambda f, s, a: self._wm.heads["jumping_steps"](
@@ -139,11 +183,11 @@ class LS_Imagine(nn.Module):
         ).mode()
 
         jump_indicator = lambda s: self._wm.heads["jump"](
-            self._wm.dynamics.get_feat(s)
+            self._wm.get_feat(s)
         ).mean
 
         is_end = lambda s: self._wm.heads["end"](
-            self._wm.dynamics.get_feat(s)
+            self._wm.get_feat(s)
         ).mean
 
         #行为学习

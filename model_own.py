@@ -130,19 +130,24 @@ class MCUnet(nn.Module):
 
 
 class WorldModel(nn.Module):
+# model_own.py -> WorldModel 类
+
     def __init__(self, obs_space, act_space, step, config):
         super(WorldModel, self).__init__()
         self._use_amp = True if config.precision == 16 else False
         self._config = config
-        shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()} # 'image': (64, 64, 3)
+        shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
         self.encoder = networks.MultiEncoder(shapes, **config.encoder)
         self.embed_size = self.encoder.outdim
-        # --- [修改] 核心：Iso-Dream 双流架构初始化 ---
+
+        # === 1. 初始化 Heads 容器 (必须在最前面) ===
+        self.heads = nn.ModuleDict()
+
+        # === 2. 初始化动力学模型 (Iso-Dream vs 单流) ===
         if config.use_iso_dream:
             print(f"🔥 WorldModel: 启用 Iso-Dream 双流架构 (Z-Stoch={config.dyn_stoch_z}, Z-Deter={config.dyn_deter_z})")
             
-            # 1. 可控分支 (S) - Action Conditioned
-            # [关键] action_free=False, 且 num_actions 必须传
+            # --- S 分支 (可控) ---
             self.dynamics_s = networks.RSSM(
                 config.dyn_stoch, config.dyn_deter, config.dyn_hidden,
                 config.dyn_rec_depth, config.dyn_discrete, config.act,
@@ -152,8 +157,7 @@ class WorldModel(nn.Module):
                 action_free=False 
             )
             
-            # 2. 不可控分支 (Z) - Action Free
-            # [关键] action_free=True, 它的维度参数使用 config.dyn_..._z
+            # --- Z 分支 (不可控) ---
             self.dynamics_z = networks.RSSM(
                 config.dyn_stoch_z, config.dyn_deter_z, config.dyn_hidden,
                 config.dyn_rec_depth, config.dyn_discrete, config.act,
@@ -163,8 +167,7 @@ class WorldModel(nn.Module):
                 action_free=True 
             )
 
-            # 3. 计算拼接后的总特征维度 (S + Z)
-            # S 分支维度
+            # --- 计算特征维度 (S + Z) ---
             if config.dyn_discrete:
                 feat_s = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
                 feat_z = config.dyn_stoch_z * config.dyn_discrete + config.dyn_deter_z
@@ -172,14 +175,13 @@ class WorldModel(nn.Module):
                 feat_s = config.dyn_stoch + config.dyn_deter
                 feat_z = config.dyn_stoch_z + config.dyn_deter_z
             
+            # [关键] 保存总维度 (例如 5120 + 1536 = 6656)
             self.feat_size = feat_s + feat_z
             
-            # 4. 逆动力学头 (Inverse Dynamics) - 仅针对 S 分支
-            # 输入：S(t-1) + S(t) -> 预测：Action(t-1)
-            # 使用现有的 networks.MLP，省去定义新类
+            # --- 逆动力学头 (仅针对 S 分支) ---
             self.heads["inverse"] = networks.MLP(
-                feat_s * 2, # 输入维度
-                (config.num_actions,), # 输出维度
+                feat_s * 2, # 输入 S(t-1) + S(t)
+                (config.num_actions,),
                 config.reward_head["layers"], 
                 config.units, config.act, config.norm,
                 dist="onehot" if hasattr(act_space, "n") else "normal",
@@ -188,9 +190,7 @@ class WorldModel(nn.Module):
                 name="Inverse"
             )
             
-            # [警告] 不要设置 self.dynamics！
-            # 这会强迫所有调用 self.dynamics 的旧代码（如 video_pred）报错，
-            # 提示你去修改它们，而不是悄无声息地算出错误结果。
+            # 禁用 self.dynamics 以防止误用
             self.dynamics = None 
 
         else:
@@ -208,21 +208,16 @@ class WorldModel(nn.Module):
                 self.feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
             else:
                 self.feat_size = config.dyn_stoch + config.dyn_deter
-        # ----------------------------------------------------
 
-        self.heads = nn.ModuleDict()
-
-        if config.dyn_discrete:
-            feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
-        else:
-            feat_size = config.dyn_stoch + config.dyn_deter
-
+        # === 3. 初始化通用 Heads ===
+        # [关键修复] 所有 Head 必须使用 self.feat_size (6656)，而不是重新计算单流维度
+        
         self.heads["decoder"] = networks.MultiDecoder(
-            feat_size, shapes, **config.decoder
+            self.feat_size, shapes, **config.decoder
         )
 
         self.heads["reward"] = networks.MLP(
-            feat_size,
+            self.feat_size,
             (255,) if config.reward_head["dist"] == "symlog_disc" else (),
             config.reward_head["layers"],
             config.units,
@@ -235,7 +230,7 @@ class WorldModel(nn.Module):
         )
 
         self.heads["end"] = networks.MLP(
-            feat_size,
+            self.feat_size,
             (),
             config.end_head["layers"],
             config.units,
@@ -248,7 +243,7 @@ class WorldModel(nn.Module):
         )
 
         self.heads["jump"] = networks.MLP(
-            feat_size,
+            self.feat_size,
             (),
             config.jump_head["layers"],
             config.units,
@@ -261,7 +256,7 @@ class WorldModel(nn.Module):
         )
 
         self.heads["intrinsic"] = networks.MLP(
-            feat_size,
+            self.feat_size,
             (255,) if config.intrinsic_head["dist"] == "symlog_disc" else (),
             config.intrinsic_head["layers"],
             config.units,
@@ -274,7 +269,7 @@ class WorldModel(nn.Module):
         )
 
         self.heads["jumping_steps"] = networks.MLP(
-            feat_size * 2,
+            self.feat_size * 2, # 输入双倍特征
             (255,) if config.jumping_steps_head["dist"] == "symlog_disc" else (),
             config.jumping_steps_head["layers"],
             config.units,
@@ -287,7 +282,7 @@ class WorldModel(nn.Module):
         )
 
         self.heads["accumulated_reward"] = networks.MLP(
-            feat_size * 2,
+            self.feat_size * 2, # 输入双倍特征
             (255,) if config.accumulated_reward_head["dist"] == "symlog_disc" else (),
             config.accumulated_reward_head["layers"],
             config.units,
@@ -360,7 +355,7 @@ class WorldModel(nn.Module):
                         )
                         # 2. Z分支 (不可控): Action 为 None
                         post_z, prior_z = self.dynamics_z.observe(
-                            embed, None, data["is_first"]
+                            embed, data["action"], data["is_first"]
                         )
 
                         # 3. 拼接特征 (用于 Decoder 和 Heads)
@@ -387,12 +382,17 @@ class WorldModel(nn.Module):
                         feat_s_prev = feat_s[:, :-1]
                         feat_s_curr = feat_s[:, 1:]
                         # InverseHead 在 __init__ 中定义为 self.heads["inverse"]
-                        pred_action = self.heads["inverse"](feat_s_prev, feat_s_curr)
-                        
+                        #pred_action = self.heads["inverse"](feat_s_prev, feat_s_curr)
+                        inv_input = torch.cat([feat_s_prev, feat_s_curr], dim=-1) # (Batch, T-1, 10240)
+                        #pred_action = self.heads["inverse"](inv_input)
+                        # 预测动作分布 (得到的是 Distribution 对象，不是 Tensor!)
+                        pred_action_dist = self.heads["inverse"](inv_input)
+
                         # [修正] 剥离 Action 的 Mask 维度 (LS-Imagine 特有的第13维)
                         # data["action"] shape: [B, T, 13] -> target: [B, T-1, 12]
                         target_action = data["action"][:, :-1, :-1] 
                         
+                        """
                         if self._config.actor["dist"] == "onehot":
                             # 如果是 OneHot 分布，转换为索引计算 CrossEntropy
                             target_idx = torch.argmax(target_action, dim=-1)
@@ -403,7 +403,10 @@ class WorldModel(nn.Module):
                             )
                         else:
                             inv_loss = F.mse_loss(pred_action, target_action)
-
+                        """
+                        # 不要用 F.cross_entropy，因为 pred_action_dist 已经封装了 logits
+                        inv_loss = -pred_action_dist.log_prob(target_action).mean()
+                        
                         # 6. 构造统一的 post 字典供 Behavior 使用
                         # Z 分支的 Key 加上 'z_' 前缀，方便 ImagBehavior 拆包
                         post = {**post_s}
@@ -472,11 +475,12 @@ class WorldModel(nn.Module):
                                 embed_zoomed, data_zoomed["action"], data_zoomed["is_first"], 
                                 sel_post_s, sel_prior_s
                             )
-                            # Z 分支: Action=None
+                            # Z 分支: [关键修改] 传入 Dummy Action (复用 data_zoomed["action"])
+                            # RSSM 内部因为 action_free=True 会自动忽略这个动作，但它能保证 shape 匹配，避免报错
                             post_zoom_z, prior_zoom_z = self.dynamics_z.observe_zoomed(
-                                embed_zoomed, None, data_zoomed["is_first"], 
+                                embed_zoomed, data_zoomed["action"], data_zoomed["is_first"], 
                                 sel_post_z, sel_prior_z
-                            )
+)
 
                             # 4. 计算 Zoomed KL Loss
                             kl_s_z, _, dyn_s_z, rep_s_z = self.dynamics_s.kl_loss(
@@ -647,6 +651,40 @@ class WorldModel(nn.Module):
             else:
                 return post, None, context, metrics
         
+    def get_dist(self, state):
+        """
+        [新增] 通用分布获取方法。
+        用于计算熵 (Entropy)。在 Iso-Dream 模式下，我们主要关注可控分支 (S) 的熵。
+        """
+        if self._config.use_iso_dream:
+            # 1. 拆分出 S 分支的状态
+            state_s = {k: v for k, v in state.items() if not k.startswith("z_")}
+            # 2. 返回 S 分支的分布
+            return self.dynamics_s.get_dist(state_s)
+        else:
+            # 原版逻辑
+            return self.dynamics.get_dist(state)
+
+    def get_feat(self, state):
+        """
+        通用特征提取方法，自动适配 Iso-Dream 双流架构。
+        """
+        if self._config.use_iso_dream:
+            # 1. 拆分混合状态字典
+            state_s = {k: v for k, v in state.items() if not k.startswith("z_")}
+            state_z = {k[2:]: v for k, v in state.items() if k.startswith("z_")}
+            
+            # 2. 分别提取特征
+            feat_s = self.dynamics_s.get_feat(state_s)
+            feat_z = self.dynamics_z.get_feat(state_z)
+            
+            # 3. 拼接
+            return torch.cat([feat_s, feat_z], dim=-1)
+        else:
+            # 原版逻辑
+            return self.dynamics.get_feat(state)
+        
+        
     # this function is called during both rollout and training
     def preprocess(self, obs, zoomed=False):
         obs = obs.copy()
@@ -728,7 +766,7 @@ class WorldModel(nn.Module):
             prior_s = self.dynamics_s.imagine_with_action(data["action"][:6, 5:], init_s)
             # Z 分支推演 (无动作，自动演化)
             # 注意: imagine_with_action 内部调用 img_step，我们传入 None 动作即可
-            prior_z = self.dynamics_z.imagine_with_action(None, init_z) 
+            prior_z = self.dynamics_z.imagine_with_action(data["action"], init_z) 
             
             # 4. Open-loop Prediction (解码预测)
             feat_s_prior = self.dynamics_s.get_feat(prior_s)
@@ -779,10 +817,30 @@ class ImagBehavior(nn.Module):
         self.gamma_sum = torch.tensor(self.gamma_sum, dtype=torch.float32, device=config.device)
 
         self._world_model = world_model
-        if config.dyn_discrete:
-            feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
+
+        # ==============================================================
+        # [关键修复] 直接使用 WorldModel 计算好的 feat_size
+        # WorldModel 已经在 __init__ 里正确计算了 S+Z 的总维度 (6656)
+        # ==============================================================
+        if hasattr(world_model, "feat_size"):
+            feat_size = world_model.feat_size
         else:
-            feat_size = config.dyn_stoch + config.dyn_deter
+            # 如果 WorldModel 还没初始化完 (防御性代码)，手动重新计算
+            if config.dyn_discrete:
+                feat_s = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
+            else:
+                feat_s = config.dyn_stoch + config.dyn_deter
+            
+            if config.use_iso_dream:
+                if config.dyn_discrete:
+                    feat_z = config.dyn_stoch_z * config.dyn_discrete + config.dyn_deter_z
+                else:
+                    feat_z = config.dyn_stoch_z + config.dyn_deter_z
+                feat_size = feat_s + feat_z
+            else:
+                feat_size = feat_s
+        # ==============================================================
+
         self.actor = networks.MLP(
             feat_size,
             (config.num_actions,),
@@ -874,7 +932,7 @@ class ImagBehavior(nn.Module):
                 for k, v in start.items():
                     imag_state[k] = v.unsqueeze(0) # [1, N, xx, xx]
 
-                action_example = self.actor(self._world_model.dynamics.get_feat(start).detach()).sample()
+                action_example = self.actor(self._world_model.get_feat(start).detach()).sample()
                 action_dimension = action_example.shape[-1]
 
                 jump_record = torch.empty((0, state_num), device=self._config.device) # [0, N]
@@ -923,7 +981,7 @@ class ImagBehavior(nn.Module):
                 jump_record = torch.cat((jump_record, last_jump_record), dim=0) # [L, N]
                 jump_num = torch.sum(jump_record)
 
-                imag_feat = self._world_model.dynamics.get_feat(imag_state) # [L, N, xx, xx]
+                imag_feat = self._world_model.get_feat(imag_state) # [L, N, xx, xx]
                 inp = imag_feat[-1].detach()
                 last_imag_action = self.actor(inp).sample() # [N, xx, xx]
                 imag_action = torch.cat((imag_action, last_imag_action.unsqueeze(0)), dim=0) # [L, N, xx]
@@ -975,7 +1033,7 @@ class ImagBehavior(nn.Module):
 
 
                 actor_ent = self.actor(imag_feat).entropy() 
-                state_ent = self._world_model.dynamics.get_dist(imag_state).entropy()
+                state_ent = self._world_model.get_dist(imag_state).entropy()
 
                 jump_sequence_record = torch.any(jump_record, dim=0, keepdim=True).repeat(jump_record.size(0), 1) # [L, N]
                 jump_record_tensor = jump_record.unsqueeze(-1) # [L, N, 1]
@@ -1120,19 +1178,51 @@ class ImagBehavior(nn.Module):
         
 
     def _imagine(self, start, policy, horizon):
-        dynamics = self._world_model.dynamics
+        # [修改] 根据配置获取 S 和 Z 分支 (不再直接用 self.dynamics)
+        use_iso = self._config.use_iso_dream
+        dyn_s = self._world_model.dynamics_s if use_iso else self._world_model.dynamics
+        dyn_z = self._world_model.dynamics_z if use_iso else None
 
         def step(prev, _):
             state, _, _ = prev
-            feat = dynamics.get_feat(state)
+            
+            # === [核心修改] 双流特征提取 ===
+            if use_iso:
+                # 1. 拆包: 将混合状态拆分为 S 和 Z
+                state_s = {k: v for k, v in state.items() if not k.startswith("z_")}
+                state_z = {k[2:]: v for k, v in state.items() if k.startswith("z_")}
+                
+                # 2. 提取特征并拼接 (S+Z)
+                feat_s = dyn_s.get_feat(state_s)
+                feat_z = dyn_z.get_feat(state_z)
+                feat = torch.cat([feat_s, feat_z], dim=-1)
+            else:
+                feat = dyn_s.get_feat(state)
+            # ==============================
+
             inp = feat.detach()
             action = policy(inp).sample()
             
-            # When interacting with the wm, the action needs to be expanded to 13 dimensions.
+            # Action 扩展 (LS-Imagine 特有的 13 维处理)
             zeros_tensor = torch.zeros(action.shape[0], 1).to(action.device)
             new_action = torch.cat((action, zeros_tensor), dim=-1)
             
-            succ = dynamics.img_step(state, new_action)
+            # === [核心修改] 双流推演 ===
+            if use_iso:
+                # S 分支: 受动作控制
+                succ_s = dyn_s.img_step(state_s, new_action)
+                
+                # Z 分支: 传入 Dummy Action (RSSM 内部会忽略它，但传入它可以防止报错)
+                succ_z = dyn_z.img_step(state_z, new_action)
+                
+                # 打包回混合状态 (给 Z 的 key 加上前缀)
+                succ = {**succ_s}
+                for k, v in succ_z.items():
+                    succ[f"z_{k}"] = v
+            else:
+                succ = dyn_s.img_step(state, new_action)
+            # ========================
+
             return succ, feat, action
 
         succ, feats, actions = tools.static_scan(
@@ -1151,6 +1241,7 @@ class ImagBehavior(nn.Module):
             return feats, states, actions
 
     def _jumpy(self, start, policy, horizon):
+        # [修改] 获取动力学模型
         use_iso = self._config.use_iso_dream
         dyn_s = self._world_model.dynamics_s if use_iso else self._world_model.dynamics
         dyn_z = self._world_model.dynamics_z if use_iso else None
@@ -1158,11 +1249,13 @@ class ImagBehavior(nn.Module):
         def step(prev, _):
             state, _, _ = prev
             
-            # === [修改] 获取特征 ===
+            # [修改] 特征提取
             if use_iso:
                 state_s = {k: v for k, v in state.items() if not k.startswith("z_")}
                 state_z = {k[2:]: v for k, v in state.items() if k.startswith("z_")}
-                feat = torch.cat([dyn_s.get_feat(state_s), dyn_z.get_feat(state_z)], dim=-1)
+                feat_s = dyn_s.get_feat(state_s)
+                feat_z = dyn_z.get_feat(state_z)
+                feat = torch.cat([feat_s, feat_z], dim=-1)
             else:
                 feat = dyn_s.get_feat(state)
             
@@ -1173,31 +1266,28 @@ class ImagBehavior(nn.Module):
             new_action = torch.zeros(action.shape[0], action.shape[1] + 1).to(action.device)
             new_action[:, -1] = 1 # Jump Flag
             
-            # === [修改] 双流推演 ===
+            # [修改] 双流推演
             if use_iso:
-                # S 分支: 执行 Jump (输入 new_action)
-                succ_s = dyn_s.img_step(state_s, new_action)
-                # Z 分支: 执行 Rollout (忽略动作)
-                # 注意: 这里 Z 只是演化一步，时间上对应 S 的一步 Jump (Delta t)。
-                # 理想情况下 Z 应该 rollout 多步，但为了对齐 Batch 维度，我们暂且让 Z 也 "跳" 一步 (网络会学会适应这种跨度)
-                succ_z = dyn_z.img_step(state_z, None)
+                succ_s = dyn_s.img_step(state_s, new_action) # S 跳跃
+                succ_z = dyn_z.img_step(state_z, new_action) # Z 跟随 (忽略动作)
                 
                 succ = {**succ_s}
-                for k, v in succ_z.items(): succ[f"z_{k}"] = v
+                for k, v in succ_z.items():
+                    succ[f"z_{k}"] = v
             else:
                 succ = dyn_s.img_step(state, new_action)
-                
+            
             return succ, feat, action
         
         succ, feats, actions = tools.static_scan(
             step, [torch.arange(horizon)], (start, None, None)
         )
         
-        # ... (后续打包代码保持不变，succ 已经是处理好的字典了) ...
         states = {k: torch.cat([start[k][None], v[:-1]], 0) for k, v in succ.items()}
 
         if horizon == 1:
-            for k, v in succ.items(): succ[k] = v.squeeze(0)
+            for k, v in succ.items():
+                succ[k] = v.squeeze(0)
             feats = feats.squeeze(0)
             actions = actions.squeeze(0)
             return feats, succ, actions

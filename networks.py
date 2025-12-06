@@ -193,31 +193,31 @@ class RSSM(nn.Module):
     # 核心功能1：观察序列 (Training 阶段用)
     # =========================================================================
     def observe(self, embed, action, is_first, state=None):
-        """
-        输入：一整段视频的特征 (embed)、动作 (action)
-        输出：每一帧的后验状态 (post) 和先验状态 (prior)
-        """
-        # 维度变换：PyTorch RNN 通常要求 (Time, Batch, Channel)
-        # swap 把 (Batch, Time, ...) 变成 (Time, Batch, ...) 以便循环
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
-        # (batch, time, ch) -> (time, batch, ch)
+        
+        # === [关键修复] 保证 action 永远不是 None ===
+        if action is None:
+            # 如果是 Z 分支，造一个假的 action 占位符
+            # 形状参考 embed: (Batch, Time, ...) -> Action: (Batch, Time, 1)
+            # 这里的 1 只是占位，RSSM.img_step 会根据 self._action_free=True 忽略它
+            batch, time_steps = embed.shape[:2]
+            action = torch.zeros((batch, time_steps, 1), device=embed.device)
+        # ==========================================
+
+        if state is None:
+            state = self.initial(action.shape[0])
+            
         embed, action, is_first = swap(embed), swap(action), swap(is_first)
-        # prev_state[0] means selecting posterior of return(posterior, prior) from obs_step
+
         post, prior = tools.static_scan(
-            lambda prev_state, prev_act, embed, is_first: self.obs_step(
-                prev_state[0], prev_act, embed, is_first
-            ),
+            # 注意这里使用 *args 接收，你在上一步改对了，这里保持
+            lambda prev, *args: self.obs_step(prev[0], *args),
             (action, embed, is_first),
             (state, state),
         )
 
-        # 把维度换回来
-        # (batch, time, stoch, discrete_num) -> (batch, time, stoch, discrete_num)
         post = {k: swap(v) for k, v in post.items()}
         prior = {k: swap(v) for k, v in prior.items()}
-
-        # post: 看了图之后的理解 (用于训练 Encoder/Decoder)
-        # prior: 没看图的预测 (用于训练 Dynamics Model，让它猜得更准)
         return post, prior
 
     # =========================================================================
@@ -335,52 +335,56 @@ class RSSM(nn.Module):
     # =========================================================================
     def img_step(self, prev_state, prev_action, sample=True):
         """
-        这一步发生了什么：
-        1. 仅根据 t-1 的状态和动作，推测 t 的状态。
-        2. 不看答案 (没有 embed)。
+        Input:
+            prev_state: 上一时刻的潜在状态 (包含 stoch, deter)
+            prev_action: 上一时刻采取的动作 (Action-Free 分支时应为 None 或被忽略)
+        Output:
+            prior: 对当前时刻状态的先验预测 (不包含后验信息)
         """
+        # ==========================================================
+        # [关键修复] 必须先从 prev_state 中提取 stoch
+        # 无论后面分支如何走，这个变量都必须存在
+        # ==========================================================
+        prev_stoch = prev_state["stoch"]
+        
         # 1. 如果是离散状态，展平特征
         if self._discrete:
+            # 确保 shape 逻辑正确
             shape = list(prev_stoch.shape[:-2]) + [self._stoch * self._discrete]
-            # (batch, stoch, discrete_num) -> (batch, stoch * discrete_num)
             prev_stoch = prev_stoch.reshape(shape)
         
-        # 2. [核心修改] 根据分支类型决定输入内容
+        # 2. 根据分支类型决定输入内容
         if self._action_free:
             # === Z 分支 (不可控) ===
             # 强制忽略动作，只看上一时刻的状态
             x = prev_stoch
         else:
             # === S 分支 (可控) ===
-            # 必须包含动作，否则无法预测位移
+            # 必须包含动作
             if prev_action is None:
-                # 这是一个防御性报错，帮你快速定位 Bug
                 raise ValueError("Error: Action-Conditioned RSSM requires a valid action input!")
             
             # 拼接: [State, Action]
             x = torch.cat([prev_stoch, prev_action], -1)
 
-        # (batch, stoch * discrete_num + action, embed) -> (batch, hidden)
+        # 3. 线性层特征提取
         x = self._img_in_layers(x)
-
-        # 2. 更新长期记忆 GRU (h)
-        # 这里的 deter 就是 h
-        for _ in range(self._rec_depth):  # rec depth is not correctly implemented
-            deter = prev_state["deter"]
-            # (batch, hidden), (batch, deter) -> (batch, deter), (batch, deter)
-            x, deter = self._cell(x, [deter]) # x 是 GRU 的输出，deter 是新的 hidden state
-            deter = deter[0]  # Keras wraps the state in a list.
         
-        # 3. 预测当前的随机状态 z
-        # (batch, deter) -> (batch, hidden)
-        x = self._img_out_layers(x)
-        # (batch, hidden) -> (batch_size, stoch, discrete_num)
-        stats = self._suff_stats_layer("ims", x) # "ims" 表示 imagination (想象)
+        # 4. GRU 循环层推演
+        deter = prev_state["deter"]
+        x, deter = self._cell(x, [deter]) 
+        deter = deter[0] 
 
+        # 5. 输出先验分布参数
+        x = self._img_out_layers(x)
+        stats = self._suff_stats_layer("ims", x)
+        
+        # 6. 采样得到随机状态 z_t
         if sample:
             stoch = self.get_dist(stats).sample()
         else:
             stoch = self.get_dist(stats).mode()
+            
         prior = {"stoch": stoch, "deter": deter, **stats}
         return prior
 
