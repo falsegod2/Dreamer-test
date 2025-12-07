@@ -250,6 +250,12 @@ class WorldModel(nn.Module):
                 name="accumulated_reward",
             )
        
+        # [新增修改]：如果是 Baseline 模式，自动从配置中移除不存在的 grad_heads，防止报错
+        if self.is_baseline:
+            print("保留dreamer的head")
+            # 过滤列表，只保留那些实际存在的 head
+            config.grad_heads = [name for name in config.grad_heads if name in self.heads]
+
         for name in config.grad_heads:
             assert name in self.heads, name
 
