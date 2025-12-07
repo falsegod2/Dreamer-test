@@ -667,16 +667,6 @@ def _add_wrappers(
         clip_reward = MinedojoClipReward()
         env = ClipWrapper(env, clip_reward, **clip_specs)
 
-    if concentration_specs is not None:
-        unet_ckpt = concentration_specs.get("unet_checkpoint_dir", "envs/tasks/base/unet_checkpoint")
-        sigma_w = concentration_specs.get("gaussian_sigma_weight", 0.5)
-        concentration_reward = MinedojoConcentrationReward(
-            unet_checkpoint_dir=unet_ckpt, 
-            output_dir=log_dir, 
-            gaussian_sigma_weight=sigma_w
-        )
-        env = ConcentrationWrapper(env, concentration_reward, **concentration_specs)
-
     # LS-Imagine 核心逻辑 Wrapper
     env = MinedojoLSImagineWrapper(env, **(LS_Imagine_specs or {}))
 
