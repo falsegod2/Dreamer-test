@@ -114,8 +114,9 @@ class LS_Imagine(nn.Module):
 
     def _train(self, data):
         metrics = {}
+        
         # World Model 训练
-        # 如果是 Baseline 模式，post_zoomed 将会是 None
+        # 如果是 Baseline 模式，post_zoomed 将会是 None (需要在 WorldModel 中实现)
         post, post_zoomed, context, mets = self._wm._train(data)
         metrics.update(mets)
 
@@ -124,23 +125,24 @@ class LS_Imagine(nn.Module):
             self._wm.dynamics.get_feat(s)
         ).mode()
 
-        # 检查是否为 Baseline 模式
+        # [修改点]: 获取 baseline 配置
         is_baseline = getattr(self._config, 'baseline', False)
 
         if is_baseline:
-            # [修改]：Baseline 模式下，这些特有的 Head 不存在，传入 None
+            # [修改点]: Baseline 模式下，这些特有的 Head 不存在或不需要训练，传入 None
+            # 注意: ImagBehavior._train 必须能够处理这些参数为 None 的情况
             intrinsic = None
             jumping_steps = None
             accumulated_reward = None
             jump_indicator = None
             
-            # DreamerV3 仍然需要终止信号来计算 discount
+            # DreamerV3 仍然需要终止信号(end/discount)来计算 value target
             is_end = lambda s: self._wm.heads["end"](
                 self._wm.dynamics.get_feat(s)
             ).mean
             
         else:
-            # LS-Imagine 模式：定义所有特有的预测器
+            # [修改点]: LS-Imagine 模式，定义所有特有的预测器 lambda
             intrinsic = lambda f, s, a: self._wm.heads["intrinsic"](
                 self._wm.dynamics.get_feat(s)
             ).mode() 
@@ -162,7 +164,7 @@ class LS_Imagine(nn.Module):
             ).mean
 
         # Behavior 训练
-        # 修改后的 ImagBehavior._train 已经可以处理 None 参数
+        # 传递上面定义好的 (可能是 None 的) 预测器
         metrics.update(self._task_behavior._train(
             post, 
             post_zoomed, 
@@ -188,6 +190,7 @@ class LS_Imagine(nn.Module):
 
 
 def main(config):
+
     """
     1. 全局设置与日志初始化 (Global Setup & Logging)
     """
@@ -195,13 +198,6 @@ def main(config):
     if config.deterministic_run:
         tool_own.enable_deterministic_run()
 
-    """--- 配置路径结构 ---"""
-    '''
-    logdir = pathlib.Path(config.logdir).expanduser()
-    logdir = logdir / config.task / f'seed_{config.seed}'
-    timestamp = datetime.now().strftime('%Y%m%dT%H%M%S')
-    logdir = logdir / timestamp
-    '''
     """--- 配置路径结构 ---"""
     # [修改开始] 支持指定恢复路径
     if hasattr(config, 'resume_path') and config.resume_path:
@@ -249,31 +245,6 @@ def main(config):
 
     directory = config.evaldir
     eval_eps = tool_own.load_episodes(directory, limit=1)
-    """
-    情景一：离线训练模式 (Offline Training)
-        如果指定了 offline_traindir，并且 load_episodes 的 limit=10：
-        现象：Agent 只会加载磁盘中最新的 1 个 Episode（假设该 Episode 长度大于 10 步）。
-        能否运行？：能运行。
-        因为 1 个 Episode（通常 1000 步）大于 batch_length (32 步)，make_dataset 和 sample_episodes 可以正常从这 1 个 Episode 中采样切片，不会报错。
-        训练后果：严重的过拟合 (Severe Overfitting)。
-        世界模型和 Agent 会反复在这同一个 Episode 上训练成千上万次。
-        模型会迅速“背诵”下这 1000 步的所有像素变化，但在任何稍微不同的场景下（泛化能力）都会彻底失效。
-        LS-Imagine 需要学习长短期跳转，单个 Episode 无法提供足够的多样性来学习这种复杂的动态。
-    情景二：在线训练模式 - 恢复训练 (Online Resume)
-        如果你是在一个已经有大量 .npz 文件的目录下继续训练（Resume），并且 load_episodes 的 limit=10：
-        现象：“部分失忆” (Partial Amnesia)。
-        程序启动时，只“回忆”起上次运行的最后 1 个 Episode。之前几天跑出来的几千个 Episodes 都会被忽略，没有加载进内存。
-        后续过程：
-        程序进入 simulate 环节。注意，此时 simulate 使用的是配置文件中未修改的 dataset_size (1,000,000)。
-        Agent 会基于这仅有的 1 个 Episode 开始新的交互。
-        随着交互进行，新的数据会不断填入 Buffer。因为 dataset_size 很大，Buffer 会正常增长，直到存满 1,000,000 步。
-        训练后果：冷启动问题。
-        虽然最终 Buffer 会恢复正常，但训练初期由于丢失了历史经验，Agent 的表现可能会突然大幅下降，需要重新花费大量时间去探索和收集数据，才能恢复到之前的性能水平。
-    情景三：在线训练模式 - 全新开始 (Fresh Start)
-        如果你在一个空目录下开始新训练：
-        现象：没有任何影响。
-        原因：目录下没有文件，load_episodes 什么也读不到（无论 limit 是 10 还是 100 万）。程序会进入 prefill 阶段（随机探索），此时使用的是配置文件中的 dataset_size，一切正常运行。
-    """
 
     """ --- 获取任务详细规格 (MineDojo Specs) --- """
     suite, task = config.task.split("_", 1)
@@ -430,7 +401,8 @@ def main(config):
             "optims_state_dict": tool_own.recursively_collect_optim_state_dict(agent),
         }
         torch.save(items_to_save, logdir / "latest.pt")
-        
+
+    
     """
     6. 清理与结束 (Cleanup)
     """
@@ -493,4 +465,3 @@ if __name__ == "__main__":
 
     #(4)应用“最高优先级”配置并运行
     main(parser.parse_args(remaining))
-

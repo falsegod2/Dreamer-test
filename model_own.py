@@ -135,7 +135,7 @@ class WorldModel(nn.Module):
         self._use_amp = True if config.precision == 16 else False
         self._config = config
         
-        # [修改]：添加 baseline 标志位检查，默认为 False 以兼容旧配置
+        # [修改]：添加 baseline 标志位检查
         self.is_baseline = getattr(config, 'baseline', False)
 
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()} # 'image': (64, 64, 3)
@@ -196,7 +196,7 @@ class WorldModel(nn.Module):
             name="End",
         )
 
-        # [修改]：如果是 Baseline，不初始化 LS-Imagine 特有的 Heads
+        # [修改]：如果是 Baseline，跳过初始化 LS-Imagine 特有的 Heads
         if not self.is_baseline:
             self.heads["jump"] = networks.MLP(
                 feat_size,
@@ -250,10 +250,9 @@ class WorldModel(nn.Module):
                 name="accumulated_reward",
             )
        
-        # [新增修改]：如果是 Baseline 模式，自动从配置中移除不存在的 grad_heads，防止报错
+        # [修改]：Baseline 模式下，从 config.grad_heads 中移除不存在的 keys
+        # 这就是解决 "AssertionError: intrinsic" 的关键
         if self.is_baseline:
-            print("保留dreamer的head")
-            # 过滤列表，只保留那些实际存在的 head
             config.grad_heads = [name for name in config.grad_heads if name in self.heads]
 
         for name in config.grad_heads:
@@ -280,7 +279,7 @@ class WorldModel(nn.Module):
             end=config.end_head["loss_scale"],
         )
         
-        # [修改]：Baseline 模式下不添加额外的 loss scale
+        # [修改]：Baseline 模式不添加额外 loss scale
         if not self.is_baseline:
             self._scales.update(dict(
                 jump=config.jump_head["loss_scale"],
@@ -291,7 +290,7 @@ class WorldModel(nn.Module):
 
     def _train(self, data_origin):
         
-        # [修改]：Baseline 模式强制不使用 zoomed 数据
+        # [修改]：Baseline 强制不使用 zoomed
         data = self.preprocess(data_origin, zoomed=False)
         
         if not self.is_baseline:
@@ -305,7 +304,7 @@ class WorldModel(nn.Module):
                 
                 embed = self.encoder(data)
                 
-                # LS-Imagine 逻辑：如果有 zoomed 数据，embedding 也要处理
+                # [修改]：Baseline 模式跳过 zoomed embed
                 if not self.is_baseline and zoomed_num > 0:
                     embed_zoomed = self.encoder(data_zoomed)
 
@@ -326,10 +325,9 @@ class WorldModel(nn.Module):
 
                 preds = {}
                 for name, head in self.heads.items():
-                    # [修改]：Baseline 模式下跳过 LS-Imagine 特有的 Heads
-                    if name in ["jumping_steps", "accumulated_reward", "jump", "intrinsic"] and self.is_baseline:
+                    # [修改]：Baseline 跳过特殊 head
+                    if self.is_baseline and name in ["jumping_steps", "accumulated_reward", "jump", "intrinsic"]:
                         continue
-                    # LS-Imagine 逻辑：跳过这两个 head，因为它们用于 zoomed 分支
                     if not self.is_baseline and (name == "jumping_steps" or name == "accumulated_reward"):
                         continue
 
@@ -518,12 +516,19 @@ class WorldModel(nn.Module):
         if not zoomed:
             obs["image"] = torch.Tensor(obs["image"]) / 255.0
             
-            # [修改]：Baseline 可能没有 heatmap，添加安全检查
+            # [修改]：动态处理 heatmap 维度，防止 Baseline 模式下维度错误 (got 5 and 4)
             if "heatmap" in obs:
-                obs["heatmap"] = torch.Tensor(obs["heatmap"]).unsqueeze(-1) / 255.0
+                heatmap_tensor = torch.Tensor(obs["heatmap"])
+                # 如果是 [B, H, W] 或 [B, H, W, 1]，确保它是 4 维 [B, H, W, 1]
+                # 在 Baseline 中，wrapper 传来的可能是 [B, 64, 64, 1]，
+                # 原代码是 heatmap.unsqueeze(-1)，会变成 [B, 64, 64, 1, 1]，这就是报错的原因
+                
+                # 如果已经是 4 维，就不扩充了
+                if heatmap_tensor.dim() == 3:
+                    heatmap_tensor = heatmap_tensor.unsqueeze(-1)
+                
+                obs["heatmap"] = heatmap_tensor / 255.0
             else:
-                # 如果是 Baseline，可能直接不使用 heatmap，或者在这里伪造一个占位符
-                # 假设 upstream wrapper 已经处理好了 (在 wrappers_own.py 中填零)
                 pass
 
             if "action" in obs:
@@ -540,7 +545,13 @@ class WorldModel(nn.Module):
             obs["is_zoomed"] = np.zeros_like(obs["is_zoomed"])
             obs["jump"] = np.zeros_like(obs["jump"])
             obs["image"] = torch.Tensor(obs["zoomed_image"]) / 255.0
-            obs["heatmap"] = torch.Tensor(obs["heatmap_on_zoomed"]).unsqueeze(-1) / 255.0
+            
+            # [修改]: 同样增加对 zoomed heatmap 的维度检查
+            heatmap_zoomed = torch.Tensor(obs["heatmap_on_zoomed"])
+            if heatmap_zoomed.dim() == 3:
+                heatmap_zoomed = heatmap_zoomed.unsqueeze(-1)
+            obs["heatmap"] = heatmap_zoomed / 255.0
+            
             obs["reward"] = obs["reward_on_zoomed"]
             obs['intrinsic'] = obs['intrinsic_on_zoomed']
             
@@ -564,7 +575,7 @@ class WorldModel(nn.Module):
         if zoomed:
             obs['is_first'] = np.zeros_like(obs['is_first'])
 
-        # [修改]：Baseline 可能缺少这些 key，使用 get 并提供默认值或跳过
+        # [修改]：使用 .get 并手动 unsqueeze，兼容 baseline
         if "is_zoomed" in obs:
             obs["is_zoomed"] = torch.Tensor(obs["is_zoomed"]).unsqueeze(-1)
         if "jump" in obs:
@@ -694,7 +705,7 @@ class ImagBehavior(nn.Module):
         metrics = {}
 
         # ==============================================================================
-        # 分支 1: Baseline (Standard Dreamer) 模式
+        # [修改]：分支 1: Baseline (Standard Dreamer) 模式
         # ==============================================================================
         if self.is_baseline:
             with tools.RequiresGrad(self.actor):
@@ -710,8 +721,6 @@ class ImagBehavior(nn.Module):
                     
                     # 3. 计算奖励 (Objective)
                     reward = objective(imag_feat, imag_state, imag_action)
-                    # Baseline 模式下通常不加 intrinsic_objective，除非你有其他用途
-                    # reward += intrinsic_objective(...) 
                     
                     actor_ent = self.actor(imag_feat).entropy()
                     state_ent = self._world_model.dynamics.get_dist(imag_state).entropy()
@@ -727,6 +736,7 @@ class ImagBehavior(nn.Module):
                     else:
                         discount = self._config.discount * torch.ones_like(reward)
 
+                    # [注意]：这里假设 tools.lambda_return 是 DreamerV3 标准版
                     target = tools.lambda_return(
                         reward[:-1],
                         value[:-1],
@@ -786,7 +796,6 @@ class ImagBehavior(nn.Module):
             with tools.RequiresGrad(self.value):
                 with torch.cuda.amp.autocast(self._use_amp):
                     value = self.value(value_input[:-1].detach())
-                    # target 已经是 [H-1, N, 1]，不需要再 stack，但为了兼容性检查一下
                     if isinstance(target, list):
                         target = torch.stack(target, dim=0) # [H-1, N, 1]
                     
@@ -959,7 +968,6 @@ class ImagBehavior(nn.Module):
         # ==============================================================================
         metrics.update(tools.tensorstats(value.mode(), "value"))
         
-        # 兼容 baseline 模式下 target 格式 (list of tensors) 和 LS-Imagine 模式 (stacked tensor)
         if isinstance(target, list):
             target_tensor = torch.stack(target, dim=0)
         else:
@@ -968,7 +976,7 @@ class ImagBehavior(nn.Module):
         
         metrics.update(tools.tensorstats(reward, "imag_reward"))
         
-        # Baseline 模式下没有 imagination_num_tensor，只有 LS-Imagine 有
+        # Baseline 模式下没有 imagination_num_tensor
         if not self.is_baseline:
             metrics.update(tools.tensorstats(imagination_num_tensor, "imagination_num"))
 
@@ -1085,7 +1093,6 @@ class ImagBehavior(nn.Module):
             inp = feat.detach()
             action = policy(inp).sample()
             
-            # When interacting with the wm, the action needs to be expanded to 13 dimensions.
             # [修改]：Baseline 模式下 action 维度保持不变，不需要扩展
             if not self.is_baseline:
                 zeros_tensor = torch.zeros(action.shape[0], 1).to(action.device)
@@ -1200,11 +1207,6 @@ class ImagBehavior(nn.Module):
 
         if self._config.imag_gradient == "dynamics":
             actor_target = adv
-        elif self._config.imag_gradient == "reinforce":
-            actor_target = (
-                policy.log_prob(imag_action)[:-1][:, :, None]
-                * (target - self.value(imag_feat[:-1]).mode()).detach()
-            )
         elif self._config.imag_gradient == "both":
             actor_target = (
                 policy.log_prob(imag_action)[:-1][:, :, None]

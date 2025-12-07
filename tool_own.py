@@ -535,17 +535,19 @@ from minedojo.sim import MineDojoSim
 from minedojo.tasks import MetaTaskBase, _meta_task_make, _parse_inventory_dict, ALL_TASKS_SPECS
 import envs.wrappers as wrappers
 # 在函数外部导入自定义 Wrapper，避免循环引用或缩进问题
+# [修改]：移除了 ConcentrationWrapper 的引用，以解决 ImportError
 from wrappers_own import (
     MinedojoScreenshotWrapper, 
     MinedojoRewardWrapper,
     MinedojoSuccessWrapper, 
     MinedojoTerminalWrapper, 
-    ConcentrationWrapper,
+    # ConcentrationWrapper, # <--- 已删除
     MinedojoLSImagineWrapper, 
     MinedojoSemifastResetWrapper, 
     ClipWrapper
 )
-from reward_own import MinedojoClipReward, MinedojoConcentrationReward
+# [修改]：移除了 MinedojoConcentrationReward 的引用
+from reward_own import MinedojoClipReward #, MinedojoConcentrationReward 
 
 # 加载任务配置
 try:
@@ -635,6 +637,7 @@ def _add_wrappers(
     fast_reset: int = None,
     log_dir: str = None,
     freeze_equipped: bool = True,
+    baseline: bool = False, # [修改]：新增 baseline 参数
     **kwargs
 ):
     """为环境添加各种 Wrapper"""
@@ -667,8 +670,13 @@ def _add_wrappers(
         clip_reward = MinedojoClipReward()
         env = ClipWrapper(env, clip_reward, **clip_specs)
 
+    # [修改]：彻底移除了 ConcentrationWrapper 的实例化代码
+    # if concentration_specs is not None:
+    #     ...
+
     # LS-Imagine 核心逻辑 Wrapper
-    env = MinedojoLSImagineWrapper(env, **(LS_Imagine_specs or {}))
+    # [修改]：传入 baseline 参数
+    env = MinedojoLSImagineWrapper(env, baseline=baseline, **(LS_Imagine_specs or {}))
 
     # 快速重置 Wrapper (用于加速训练)
     if fast_reset is not None:
@@ -695,6 +703,9 @@ def make_env(config, mode, id):
 
     log_dir = os.path.join(config.results_dir, config.name + "_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     
+    # [修改]：获取 baseline 配置
+    is_baseline = getattr(config, 'baseline', False)
+
     # 内部辅助 make 函数
     def _make(task_name, **kwargs):
         task_id, task_specs, sim_specs = get_specs(task_name, **kwargs)
@@ -703,7 +714,8 @@ def make_env(config, mode, id):
         # 创建基础环境
         env = _meta_task_make(meta_task_cls, **minedojo_specs)
         # 添加 Wrappers
-        env = _add_wrappers(env, task_id,  **task_specs)
+        # [修改]：将 baseline 传递给 _add_wrappers
+        env = _add_wrappers(env, task_id, baseline=is_baseline, **task_specs)
         return env
 
     # 构建环境
@@ -1090,3 +1102,64 @@ def simulate(
             cache.popitem(last=False)
 
     return (step - steps, episode - episodes, done, length, obs, agent_state, reward, information)
+
+import subprocess  # 用于执行 tar 命令
+import shutil      # 用于复制文件到云盘
+def save_colab(config,logdir):
+    # ----------------------------------------------------------------
+    # ### 修改：打包压缩并上传到云盘 (Compress & Upload Overwrite) ###
+    # ----------------------------------------------------------------
+    # ----------------------------------------------------------------
+    # ### 配置云盘备份路径 ###
+    # ----------------------------------------------------------------
+    #metric原目录
+    logdir_metric = logdir / "metrics.jsonl"
+    # 云盘根目录
+    drive_root = pathlib.Path("/content/drive/MyDrive/LS-Imagine-Backup")
+    # 云盘目标文件夹 (保持结构 task/seed)
+    drive_base = drive_root / config.task / f'seed_{config.seed}'
+    
+    # 备份文件的最终路径 (我们使用固定文件名来实现覆盖)
+    # 例如: /content/drive/.../seed_0/backup_latest.tar.gz
+    drive_archive_path = drive_base / "backup_latest.tar.gz"
+    drive_archive_path_metric = drive_base / "metrics.jsonl"
+    
+    print(f"云盘备份目标文件: {drive_archive_path}")
+    # ----------------------------------------------------------------
+    try:
+        # 1. 确保云端父目录存在
+        drive_base.mkdir(parents=True, exist_ok=True)
+        
+        # 定义临时压缩文件路径 (放在 /tmp 下，利用 Linux 内存/本地盘加速)
+        # 使用固定名字 latest_backup.tar.gz
+        tmp_archive_name = "backup_tmp.tar.gz"
+        local_tmp_path = f"/tmp/{tmp_archive_name}"
+
+        
+        print(f"正在打包目录: {logdir} -> {local_tmp_path}")
+        
+        # 2. 调用 tar 命令压缩
+        # -c: 创建
+        # -z: gzip 压缩
+        # -f: 输出文件名
+        # -C: 切换目录 (重要！这样压缩包里包含的是文件夹本身，而不是绝对路径)
+        # 压缩内容：logdir.name (即当前时间戳文件夹)
+        # 结果：解压后会得到一个以时间戳命名的文件夹
+        subprocess.run(
+            ["tar", "-czf", local_tmp_path, "-C", str(logdir.parent), str(logdir.name)],
+            check=True
+        )
+        
+        # 3. 上传 (覆盖) 到 Drive
+        print(f"正在上传到云盘 (覆盖): {drive_archive_path}")
+        subprocess.run(["cp", logdir_metric, drive_archive_path_metric], check=True)
+        subprocess.run(["cp", local_tmp_path, drive_archive_path], check=True)
+        #shutil.copy(local_tmp_path, drive_archive_path)
+        
+        # 4. 清理临时文件
+        os.remove(local_tmp_path)
+        print("备份完成。")
+        
+    except subprocess.CalledProcessError as e:
+        print(f"备份过程出错: {e}")
+        # --------------------------------------------------------------
