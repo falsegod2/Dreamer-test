@@ -114,38 +114,72 @@ class LS_Imagine(nn.Module):
 
     def _train(self, data):
         metrics = {}
+        # World Model 训练
+        # 如果是 Baseline 模式，post_zoomed 将会是 None
         post, post_zoomed, context, mets = self._wm._train(data)
         metrics.update(mets)
-        # start = (post, post_zoomed)
 
+        # 基础奖励函数 (所有模式都需要)
         reward = lambda f, s, a: self._wm.heads["reward"](
             self._wm.dynamics.get_feat(s)
         ).mode()
 
-        intrinsic = lambda f, s, a: self._wm.heads["intrinsic"](
-            self._wm.dynamics.get_feat(s)
-        ).mode() 
+        # 检查是否为 Baseline 模式
+        is_baseline = getattr(self._config, 'baseline', False)
 
-        jumping_steps = lambda f, s, a: self._wm.heads["jumping_steps"](
-            f
-        ).mean().clamp_min(1).int()
+        if is_baseline:
+            # [修改]：Baseline 模式下，这些特有的 Head 不存在，传入 None
+            intrinsic = None
+            jumping_steps = None
+            accumulated_reward = None
+            jump_indicator = None
+            
+            # DreamerV3 仍然需要终止信号来计算 discount
+            is_end = lambda s: self._wm.heads["end"](
+                self._wm.dynamics.get_feat(s)
+            ).mean
+            
+        else:
+            # LS-Imagine 模式：定义所有特有的预测器
+            intrinsic = lambda f, s, a: self._wm.heads["intrinsic"](
+                self._wm.dynamics.get_feat(s)
+            ).mode() 
 
-        accumulated_reward = lambda f, s, a: self._wm.heads["accumulated_reward"](
-            f
-        ).mode()
+            jumping_steps = lambda f, s, a: self._wm.heads["jumping_steps"](
+                f
+            ).mean().clamp_min(1).int()
 
-        jump_indicator = lambda s: self._wm.heads["jump"](
-            self._wm.dynamics.get_feat(s)
-        ).mean
+            accumulated_reward = lambda f, s, a: self._wm.heads["accumulated_reward"](
+                f
+            ).mode()
 
-        is_end = lambda s: self._wm.heads["end"](
-            self._wm.dynamics.get_feat(s)
-        ).mean
+            jump_indicator = lambda s: self._wm.heads["jump"](
+                self._wm.dynamics.get_feat(s)
+            ).mean
 
-        metrics.update(self._task_behavior._train(post, post_zoomed, reward, intrinsic, jumping_steps, accumulated_reward, jump_indicator, is_end)[-1])
+            is_end = lambda s: self._wm.heads["end"](
+                self._wm.dynamics.get_feat(s)
+            ).mean
+
+        # Behavior 训练
+        # 修改后的 ImagBehavior._train 已经可以处理 None 参数
+        metrics.update(self._task_behavior._train(
+            post, 
+            post_zoomed, 
+            reward, 
+            intrinsic, 
+            jumping_steps, 
+            accumulated_reward, 
+            jump_indicator, 
+            is_end
+        )[-1])
+
+        # 探索策略训练 (如果有)
         if self._config.expl_behavior != "greedy":
             mets = self._expl_behavior.train(post, context, data)[-1]
             metrics.update({"expl_" + key: value for key, value in mets.items()})
+            
+        # 记录指标
         for name, value in metrics.items():
             if not name in self._metrics.keys():
                 self._metrics[name] = [value]

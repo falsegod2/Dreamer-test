@@ -3,6 +3,7 @@ defaults:
   use_wandb: False
   wandb_key: None
   resume_path: null  # <--- 添加这一行
+  baseline: True
   logdir: null
   traindir: null
   evaldir: null
