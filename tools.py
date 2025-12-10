@@ -629,6 +629,8 @@ class OneHotDist(torchd.one_hot_categorical.OneHotCategorical):
             super().__init__(logits=logits, probs=probs)
 
     def mode(self):
+        # 1. 找到概率最大的类别索引 (Argmax)
+        # 2. 将其转换为 One-Hot 向量 (例如: [0, 0, 1, 0])
         _mode = F.one_hot(
             torch.argmax(super().logits, axis=-1), super().logits.shape[-1]
         )
@@ -637,11 +639,14 @@ class OneHotDist(torchd.one_hot_categorical.OneHotCategorical):
     def sample(self, sample_shape=(), seed=None):
         if seed is not None:
             raise ValueError("need to check")
+        # 1. 根据概率分布进行采样
         sample = super().sample(sample_shape)
         probs = super().probs
         while len(probs.shape) < len(sample.shape):
             probs = probs[None]
         sample += probs - probs.detach()
+        #前向传播 (Forward)：probs - probs.detach() 等于 0，所以返回值就是硬采样的 One-Hot 向量 sample
+        #反向传播 (Backward)：由于 sample 是离散的（不可导），PyTorch 无法直接对它求导。这个技巧告诉计算图：“虽然我输出的是 sample，但求导的时候请把梯度传给 probs（软概率）”。这使得整个网络即使在输出离散动作时也是端到端可微的。
         return sample
 
 

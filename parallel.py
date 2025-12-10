@@ -201,6 +201,16 @@ class Damy:
 
     def __getattr__(self, name):
         return getattr(self._env, name)
+    
+    @property
+    def id(self):
+        """
+        显式定义 id 属性，确保每次访问都从底层 env 获取最新值。
+        这能防止 ID 在某些情况下被缓存或更新不及时。
+        """
+        print(f"显式定义 id 属性,id:{self._env.id}")
+        return self._env.id
+    # -------------------------------
 
     def step(self, action):
         return lambda: self._env.step(action)

@@ -27,13 +27,27 @@ class InverseHead(nn.Module):
         return self._layers(x)
 
 class RSSM(nn.Module):
+    """
+    循环状态空间模型 (Recurrent State Space Model).
+    
+    它是 Dreamer 和 LS-Imagine 的核心“大脑”，包含两个关键过程：
+    1. 想象 (Imagination / Prior): p(z_t | h_t)
+       - 俗称“闭眼预测”。根据历史记忆预测下一刻会发生什么。
+    2. 观察 (Observation / Posterior): q(z_t | h_t, x_t)
+       - 俗称“睁眼修正”。看到真实画面后，修正自己的预测。
+       
+    支持:
+    - 离散/连续 Latent Space。
+    - Iso-Dream++ 双流架构 (S-Branch 可控 / Z-Branch 不可控)。
+    """
+
     def __init__(
         self,
-        stoch=30,       # z_t: 随机状态的维度 (Stochastic) -> 代表对当前时刻的模糊理解
-        deter=200,      # h_t: 确定性状态的维度 (Deterministic) -> GRU的隐藏层，代表长期记忆
-        hidden=200,     # 神经网络中间层的单元数
-        rec_depth=1,    # GRU的层数
-        discrete=False, # 是否使用离散分布 (DreamerV3 通常用离散分布，更稳定)
+        stoch=30,       # z_t: 随机状态维度 (代表当前时刻的随机性/模糊性)
+        deter=200,      # h_t: 确定性状态维度 (GRU隐藏层，代表长期记忆)
+        hidden=200,     # MLP 中间层维度
+        rec_depth=1,    # GRU 层数
+        discrete=False, # 是否使用离散分布 (DreamerV3/MinDojo 推荐 True)
         act="SiLU",
         norm=True,
         mean_act="none",
@@ -41,136 +55,110 @@ class RSSM(nn.Module):
         min_std=0.1,
         unimix_ratio=0.01,
         initial="learned",
-        # ... 其他参数主要用于配置激活函数、初始化等 ...
-        num_actions=None, # 动作空间大小
-        embed=None,       # 图像编码后的特征维度
+        num_actions=None, # 动作空间维度
+        embed=None,       # CNN 编码后的图像特征维度
         device=None,
-        action_free=False,  # <--- [新增] 标记是否为 Action-Free 分支
+        action_free=False,  # [Iso-Dream] 是否为不可控分支 (Z分支)
     ):
         super(RSSM, self).__init__()
-        # ... 保存参数 ...
         self._stoch = stoch
         self._deter = deter
         self._hidden = hidden
         self._min_std = min_std
-        self._rec_depth = rec_depth
         self._discrete = discrete
-        self._action_free = action_free  # <--- [记录]
-        act = getattr(torch.nn, act)
-        self._mean_act = mean_act
-        self._std_act = std_act
-        self._unimix_ratio = unimix_ratio
-        self._initial = initial
-        self._num_actions = num_actions + 1 # +1 是因为有时会填充一个空动作
+        self._action_free = action_free
+        self._num_actions = num_actions + 1 if num_actions else 0 # +1 for empty/pad action
         self._embed = embed
         self._device = device
+        self._unimix_ratio = unimix_ratio
+        self._initial = initial
 
-        inp_layers = []
-        """
-        --- 1. 想象输入层 (Prior Network) ---
-        作用：处理 [上一步随机状态 z + 动作 a] -> 准备输入给 GRU
-        也就是：根据“现状”和“动作”，推测“变化”
-        """
-        # --- [修正] 维度计算逻辑 ---
-        if self._action_free:
-            # Z分支 (不可控): 不接收动作，所以没有 num_actions，也没有 +1
-            if self._discrete:
-                inp_dim = self._stoch * self._discrete
-            else:
-                inp_dim = self._stoch
-        else:
-            # S分支 (可控): 接收动作
-            # 必须加上 LS-Imagine 特有的 "+1" (因为 preprocess 里拼接了 extra dim)
-            if self._discrete:
-                inp_dim = self._stoch * self._discrete + (num_actions or 0) + 1
-            else:
-                inp_dim = self._stoch + (num_actions or 0) + 1
-        # -------------------------
+        # 激活函数配置
+        self._act = getattr(torch.nn, act)
+        self._mean_act = mean_act
+        self._std_act = std_act
+        self._norm = norm
+
+        # --- 构建网络层 ---
+        self._build_components()
         
-        inp_layers.append(nn.Linear(inp_dim, self._hidden, bias=False))
-        if norm:
-            inp_layers.append(nn.LayerNorm(self._hidden, eps=1e-03))
-        inp_layers.append(act())
-    
-        #定义全连接层+归一化+激活函数
-        self._img_in_layers = nn.Sequential(*inp_layers)
-        self._img_in_layers.apply(tools.weight_init)
+        # --- 打印结构摘要 ---
+        self._print_summary()
 
-        """
-        # --- 2. 核心记忆单元 (GRU Cell) ---
-        # 作用：更新长期记忆 h_t。 h_t = GRU(h_{t-1}, 变化输入)
-        """
-        self._cell = GRUCell(self._hidden, self._deter, norm=norm)
-        self._cell.apply(tools.weight_init)
-
-        """
-        # --- 3. 想象输出层 (Prior Output) ---
-        # 作用：基于 GRU 的记忆 h_t，预测下一步的随机状态 z_t (先验/闭眼猜)
-        """
-        img_out_layers = []
-        inp_dim = self._deter
-        img_out_layers.append(nn.Linear(inp_dim, self._hidden, bias=False))
-        if norm:
-            img_out_layers.append(nn.LayerNorm(self._hidden, eps=1e-03))
-        img_out_layers.append(act())
-        self._img_out_layers = nn.Sequential(*img_out_layers)
-        self._img_out_layers.apply(tools.weight_init)
-
-        """
-        # --- 4. 观察输出层 (Posterior Output) ---
-        # 作用：基于 [记忆 h_t + 真实图像特征 embed]，修正随机状态 z_t (后验/睁眼看)
-        # 输入维度 = 记忆(deter) + 眼睛看到的(embed)
-        """
-        obs_out_layers = []
-        inp_dim = self._deter + self._embed
-        # ... 归一化和激活 ...
-        obs_out_layers.append(nn.Linear(inp_dim, self._hidden, bias=False))
-        if norm:
-            obs_out_layers.append(nn.LayerNorm(self._hidden, eps=1e-03))
-        obs_out_layers.append(act())
-        self._obs_out_layers = nn.Sequential(*obs_out_layers)
-        self._obs_out_layers.apply(tools.weight_init)
-
-        """
-        # --- 5. 分布映射层 (Heads) ---
-        # 作用：把上面神经网络输出的 hidden features 映射成概率分布的参数 (logits 或 mean/std)
-        # 分别用于生成“想象的 z” (imgs_stat) 和 “观察到的 z” (obs_stat)
-        """
-        if self._discrete:
-            self._imgs_stat_layer = nn.Linear(
-                self._hidden, self._stoch * self._discrete
-            )
-            self._imgs_stat_layer.apply(tools.uniform_weight_init(1.0))
-            self._obs_stat_layer = nn.Linear(self._hidden, self._stoch * self._discrete)
-            self._obs_stat_layer.apply(tools.uniform_weight_init(1.0))
-        # ... 连续分布的处理 ...
+    def _build_components(self):
+        """构建 RSSM 的四个核心组件"""
+        
+        # 1. 想象输入层 (Img In): 处理 [z_{t-1}, a_{t-1}] -> GRU 输入
+        if self._action_free:
+            # Z分支 (不可控): 仅依赖上一时刻状态，不看动作
+            inp_dim = self._stoch * (self._discrete or 1)
         else:
-            self._imgs_stat_layer = nn.Linear(self._hidden, 2 * self._stoch)
-            self._imgs_stat_layer.apply(tools.uniform_weight_init(1.0))
-            self._obs_stat_layer = nn.Linear(self._hidden, 2 * self._stoch)
-            self._obs_stat_layer.apply(tools.uniform_weight_init(1.0))
+            # S分支 (可控): 依赖上一时刻状态 + 动作
+            inp_dim = self._stoch * (self._discrete or 1) + self._num_actions
+            
+        self._img_in_layers = self._make_mlp_layers(inp_dim, self._hidden)
 
+        # 2. 循环记忆单元 (Cell): 更新长期记忆 h_t
+        self._cell = GRUCell(self._hidden, self._deter, norm=self._norm)
+
+        # 3. 想象输出头 (Img Out / Prior): h_t -> z_t (Prior)
+        # "根据记忆猜测现在的情况"
+        self._img_out_layers = self._make_mlp_layers(self._deter, self._hidden)
+        self._imgs_stat_layer = self._make_dist_head(self._hidden)
+
+        # 4. 观察输出头 (Obs Out / Posterior): [h_t, embed_t] -> z_t (Posterior)
+        # "结合记忆和真实看到的画面，确定现在的情况"
+        self._obs_out_layers = self._make_mlp_layers(self._deter + self._embed, self._hidden)
+        self._obs_stat_layer = self._make_dist_head(self._hidden)
+
+        # 初始状态参数
         if self._initial == "learned":
             self.W = torch.nn.Parameter(
                 torch.zeros((1, self._deter), device=torch.device(self._device)),
                 requires_grad=True,
             )
 
+    def _make_mlp_layers(self, in_dim, out_dim):
+        """辅助函数：构建 MLP 层 (Linear + Norm + Act)"""
+        layers = []
+        layers.append(nn.Linear(in_dim, out_dim, bias=False))
+        if self._norm:
+            layers.append(nn.LayerNorm(out_dim, eps=1e-03))
+        layers.append(self._act())
+        model = nn.Sequential(*layers)
+        model.apply(tools.weight_init)
+        return model
+
+    def _make_dist_head(self, in_dim):
+        """辅助函数：构建分布参数预测头"""
+        if self._discrete:
+            # 输出 logits: [stoch, classes]
+            out_dim = self._stoch * self._discrete
+        else:
+            # 输出 mean, std: 2 * stoch
+            out_dim = 2 * self._stoch
+        
+        layer = nn.Linear(in_dim, out_dim)
+        layer.apply(tools.uniform_weight_init(1.0))
+        return layer
+
+    def _print_summary(self):
+        """在命令行输出 RSSM 结构信息"""
+        type_str = "Action-Free (Z-Branch)" if self._action_free else "Action-Conditioned (S-Branch)"
+        print(f"  [RSSM] Initialized {type_str}")
+        print(f"         Latent: Stoch={self._stoch}, Deter={self._deter}, Discrete={self._discrete}")
+
     # =========================================================================
-    # 初始化函数
+    # 核心初始化逻辑
     # =========================================================================
     def initial(self, batch_size):
-        # ... 初始化 h_0 ...
+        """生成初始的隐状态 (通常是0或者学习到的参数)"""
         deter = torch.zeros(batch_size, self._deter).to(self._device)
-        # ... 初始化 z_0 ...
+        
         if self._discrete:
             state = dict(
-                logit=torch.zeros([batch_size, self._stoch, self._discrete]).to(
-                    self._device
-                ),
-                stoch=torch.zeros([batch_size, self._stoch, self._discrete]).to(
-                    self._device
-                ),
+                logit=torch.zeros([batch_size, self._stoch, self._discrete]).to(self._device),
+                stoch=torch.zeros([batch_size, self._stoch, self._discrete]).to(self._device),
                 deter=deter,
             )
         else:
@@ -180,65 +168,79 @@ class RSSM(nn.Module):
                 stoch=torch.zeros([batch_size, self._stoch]).to(self._device),
                 deter=deter,
             )
+            
         if self._initial == "zeros":
             return state
         elif self._initial == "learned":
+            # 如果是 learned，使用 Parameter W 来填充 deter
             state["deter"] = torch.tanh(self.W).repeat(batch_size, 1)
             state["stoch"] = self.get_stoch(state["deter"])
             return state
         else:
             raise NotImplementedError(self._initial)
-        
+
     # =========================================================================
-    # 核心功能1：观察序列 (Training 阶段用)
+    # 核心功能 1: 序列观察 (用于训练 World Model)
     # =========================================================================
     def observe(self, embed, action, is_first, state=None):
+        """
+        处理整个时间序列数据。
+        Input: 
+            embed: (Batch, Time, Embed_Dim) - 真实图像特征
+            action: (Batch, Time, Act_Dim)
+        Output:
+            post: 后验状态序列 (用于重建图像，计算 Loss)
+            prior: 先验状态序列 (用于计算 KL Loss)
+        """
+        # (Batch, Time, ...) -> (Time, Batch, ...) 为了循环处理
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
         
-        # === [关键修复] 保证 action 永远不是 None ===
+        # [Iso-Dream 修正] 如果是 Z 分支，外部可能传入 None action
         if action is None:
-            # 如果是 Z 分支，造一个假的 action 占位符
-            # 形状参考 embed: (Batch, Time, ...) -> Action: (Batch, Time, 1)
-            # 这里的 1 只是占位，RSSM.img_step 会根据 self._action_free=True 忽略它
+            # 创建占位符动作，确保 static_scan 格式正确
             batch, time_steps = embed.shape[:2]
             action = torch.zeros((batch, time_steps, 1), device=embed.device)
-        # ==========================================
 
         if state is None:
             state = self.initial(action.shape[0])
             
+        # 转换维度
         embed, action, is_first = swap(embed), swap(action), swap(is_first)
 
+        # === 核心循环 ===
+        # 这一步会依次调用 self.obs_step 处理每一个时间步
         post, prior = tools.static_scan(
-            # 注意这里使用 *args 接收，你在上一步改对了，这里保持
             lambda prev, *args: self.obs_step(prev[0], *args),
             (action, embed, is_first),
             (state, state),
         )
 
+        # (Time, Batch) -> (Batch, Time) 转回来
         post = {k: swap(v) for k, v in post.items()}
         prior = {k: swap(v) for k, v in prior.items()}
         return post, prior
 
     # =========================================================================
-    # 核心功能2：LS-Imagine 特有的 Zoom 观察
+    # 核心功能 2: Zoomed 观察 (用于 LS-Imagine 长视距训练)
     # =========================================================================
     def observe_zoomed(self, embed_zoomed, action_zoomed, is_first_zoomed, rely_post, rely_prior):
         """
-        这是论文特有的。处理那些经过 Zoom-In (放大) 处理的“跳跃”数据。
-        逻辑和 observe 基本一样，但是它依赖于主分支的状态 (rely_post, rely_prior) 作为上下文。
+        LS-Imagine 特有功能。
+        基于 Short-term 分支的状态 (rely_post)，使用 Zoomed 图像进行推演。
         """
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
-        # (batch, time, ch) -> (time, batch, ch)
-        embed_zoomed, action_zoomed, is_first_zoomed = swap(embed_zoomed), swap(action_zoomed), swap(is_first_zoomed)
-
+        
+        embed_zoomed = swap(embed_zoomed)
+        action_zoomed = swap(action_zoomed)
+        is_first_zoomed = swap(is_first_zoomed)
+        
         rely_post = {k: swap(v) for k, v in rely_post.items()}
         rely_prior = {k: swap(v) for k, v in rely_prior.items()}
 
-        # prev_state[0] means selecting posterior of return(posterior, prior) from obs_step
+        # static_scan_zoomed 是特制的工具函数，支持传入 context (rely_state)
         post_zoomed, prior_zoomed = tools.static_scan_zoomed(
-            lambda rely_state, prev_act, embed_zoomed, is_first_zoomed: self.obs_step(
-                rely_state, prev_act, embed_zoomed, is_first_zoomed
+            lambda rely_state, prev_act, emb, first: self.obs_step(
+                rely_state, prev_act, emb, first
             ),
             (action_zoomed, embed_zoomed, is_first_zoomed), 
             (rely_post, rely_prior),
@@ -250,136 +252,111 @@ class RSSM(nn.Module):
         return post_zoomed, prior_zoomed
 
     # =========================================================================
-    # 核心功能3：纯想象 (Actor Training 阶段用)
+    # 核心功能 3: 纯想象 (用于训练 Actor)
     # =========================================================================
     def imagine_with_action(self, action, state):
         """
-        输入：当前状态 state，和一串计划要做的动作 action
-        输出：想象出的未来状态 prior
-        注意：这里没有 embed 输入，因为是“闭眼”想未来。
+        在 Latent Space 中闭眼推演。只使用 Action，不使用图像。
+        用于 Actor-Critic 训练。
         """
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
-        assert isinstance(state, dict), state
         action = swap(action)
-        # 循环调用 img_step (只预测，不修正)
+        assert isinstance(state, dict), state
+
+        # 循环调用 img_step (Prior Step)
         prior = tools.static_scan(self.img_step, [action], state)
+        
         prior = prior[0]
         prior = {k: swap(v) for k, v in prior.items()}
         return prior
 
-
-
     # =========================================================================
-    # 原子操作 A：单步观察 (Posterior)
+    # 原子操作 A: 观察步 (Posterior Step)
     # =========================================================================
     def obs_step(self, prev_state, prev_action, embed, is_first, sample=True):
         """
-        这一步发生了什么：
-        1. 此时时刻是 t。
-        2. 我有 t-1 时刻的状态 (prev_state) 和动作 (prev_action)。
-        3. 我看到了 t 时刻的真实图片特征 (embed)。
+        单步观察更新：
+        1. 拿到上一步的状态 (prev_state) 和动作 (prev_action)。
+        2. 先闭眼预测当前状态 (Prior)。
+        3. 再看一眼真实图像特征 (embed)，修正得到当前状态 (Posterior)。
         """
-        # 1. 检查是否是 Episode 的第一步
-        # 如果 is_first=True，说明上一步的状态是上一个回合的，不能用。
-        # 需要重置为 initial 状态 (全0)
+        # 1. 检查是否需要重置状态 (Episode 开始)
+        # 如果 is_first=1，说明这是新回合，忽略上一步的状态，重置为 initial
         if prev_action is not None and prev_action.shape[-1] != self._num_actions:
-            shape = prev_action.shape
-            new_shape = list(shape[:-1]) + [1]
-            zero_tensor = torch.zeros(*new_shape).to(prev_action.device)
-            prev_action = torch.cat((prev_action, zero_tensor), dim=-1)
+             # Action 维度对齐 (Pad 0)
+             shape = list(prev_action.shape[:-1]) + [self._num_actions - prev_action.shape[-1]]
+             prev_action = torch.cat([prev_action, torch.zeros(shape, device=prev_action.device)], -1)
 
-
-        if prev_state == None or torch.sum(is_first) == len(is_first):
-            prev_state = self.initial(len(is_first))
-            prev_action = torch.zeros((len(is_first), self._num_actions)).to(
-                self._device
-            )
-            # prev_action.requires_grad_()
-        # overwrite the prev_state only where is_first=True
-        elif torch.sum(is_first) > 0:
+        if torch.sum(is_first) > 0:
             is_first = is_first[:, None]
-            prev_action *= 1.0 - is_first
+            prev_action *= (1.0 - is_first) # Mask action
             init_state = self.initial(len(is_first))
             for key, val in prev_state.items():
                 is_first_r = torch.reshape(
                     is_first,
                     is_first.shape + (1,) * (len(val.shape) - len(is_first.shape)),
                 )
+                # 混合：如果是 first，用 init_state；否则用 prev_state
                 prev_state[key] = (
                     val * (1.0 - is_first_r) + init_state[key] * is_first_r
                 )
 
-        # 2. 先做“闭眼预测” (Prior)
-        # 算出：基于历史，我认为现在应该是什么样？
-        prior = self.img_step(prev_state, prev_action)
-        # 3. 融合“预测”和“真实所见”
-        # 把 [预测的记忆 deter] 和 [真实看到的 embed] 拼起来
-        x = torch.cat([prior["deter"], embed], -1)
-        # 4. 通过神经网络，计算“睁眼修正”后的分布 (Posterior)
-        # (batch_size, prior_deter + embed) -> (batch_size, hidden)
-        x = self._obs_out_layers(x)
-        # (batch_size, hidden) -> (batch_size, stoch, discrete_num)
-        stats = self._suff_stats_layer("obs", x) # 得到分布参数(logits)
+        # 2. 闭眼预测 (Prior)
+        prior = self.img_step(prev_state, prev_action, sample)
 
-        # 5. 从分布中采样得到随机状态 z (stoch)
+        # 3. 睁眼修正 (Posterior)
+        # 输入: [Prior 记忆 deter, 真实图像特征 embed]
+        x = torch.cat([prior["deter"], embed], -1)
+        x = self._obs_out_layers(x)
+        
+        # 得到分布参数 (logits 或 mean/std)
+        stats = self._suff_stats_layer("obs", x)
+        
+        # 采样得到后验随机状态 z_t
         if sample:
             stoch = self.get_dist(stats).sample()
         else:
             stoch = self.get_dist(stats).mode()
-        # post 包含：修正后的 z (stoch), 记忆 h (deter), 分布参数
+            
         post = {"stoch": stoch, "deter": prior["deter"], **stats}
         return post, prior
-    
+
     # =========================================================================
-    # 原子操作 B：单步想象 (Prior)
+    # 原子操作 B: 想象步 (Prior Step)
     # =========================================================================
     def img_step(self, prev_state, prev_action, sample=True):
         """
-        Input:
-            prev_state: 上一时刻的潜在状态 (包含 stoch, deter)
-            prev_action: 上一时刻采取的动作 (Action-Free 分支时应为 None 或被忽略)
-        Output:
-            prior: 对当前时刻状态的先验预测 (不包含后验信息)
+        单步想象推演：
+        h_t = GRU(h_{t-1}, z_{t-1}, a_{t-1})
+        z_t ~ Prior(h_t)
         """
-        # ==========================================================
-        # [关键修复] 必须先从 prev_state 中提取 stoch
-        # 无论后面分支如何走，这个变量都必须存在
-        # ==========================================================
         prev_stoch = prev_state["stoch"]
-        
-        # 1. 如果是离散状态，展平特征
         if self._discrete:
-            # 确保 shape 逻辑正确
             shape = list(prev_stoch.shape[:-2]) + [self._stoch * self._discrete]
             prev_stoch = prev_stoch.reshape(shape)
-        
-        # 2. 根据分支类型决定输入内容
+
+        # 1. 准备输入
         if self._action_free:
-            # === Z 分支 (不可控) ===
-            # 强制忽略动作，只看上一时刻的状态
+            # Z 分支: 忽略动作
             x = prev_stoch
         else:
-            # === S 分支 (可控) ===
-            # 必须包含动作
+            # S 分支: 状态 + 动作
             if prev_action is None:
-                raise ValueError("Error: Action-Conditioned RSSM requires a valid action input!")
-            
-            # 拼接: [State, Action]
+                 raise ValueError("Action-Conditioned RSSM requires action input")
             x = torch.cat([prev_stoch, prev_action], -1)
 
-        # 3. 线性层特征提取
+        # 2. 特征提取 & GRU 更新
         x = self._img_in_layers(x)
         
-        # 4. GRU 循环层推演
-        deter = prev_state["deter"]
-        x, deter = self._cell(x, [deter]) 
-        deter = deter[0] 
+        prev_deter = prev_state["deter"]
+        x, deter = self._cell(x, [prev_deter])
+        deter = deter[0] # 新的确定性状态 h_t
 
-        # 5. 输出先验分布参数
+        # 3. 预测先验分布 (Prior Distribution)
         x = self._img_out_layers(x)
         stats = self._suff_stats_layer("ims", x)
-        
-        # 6. 采样得到随机状态 z_t
+
+        # 4. 采样先验随机状态 z_t
         if sample:
             stoch = self.get_dist(stats).sample()
         else:
@@ -388,15 +365,11 @@ class RSSM(nn.Module):
         prior = {"stoch": stoch, "deter": deter, **stats}
         return prior
 
-
     # =========================================================================
-    # 辅助功能
+    # 工具函数
     # =========================================================================
     def get_feat(self, state):
-        """
-        把 h (deter) 和 z (stoch) 拼起来。
-        这是为了给下游的 Actor/Critic 网络提供完整的信息。
-        """
+        """提取特征供 Actor/Critic 使用: Concat[z_t, h_t]"""
         stoch = state["stoch"]
         if self._discrete:
             shape = list(stoch.shape[:-2]) + [self._stoch * self._discrete]
@@ -404,10 +377,7 @@ class RSSM(nn.Module):
         return torch.cat([stoch, state["deter"]], -1)
 
     def get_dist(self, state, dtype=None):
-        """
-        把神经网络输出的 logits 转换成 PyTorch 的分布对象。
-        方便计算 entropy (熵) 或 log_prob (对数概率)。
-        """
+        """获取 PyTorch 分布对象"""
         if self._discrete:
             logit = state["logit"]
             dist = torchd.independent.Independent(
@@ -419,14 +389,16 @@ class RSSM(nn.Module):
                 torchd.independent.Independent(torchd.normal.Normal(mean, std), 1)
             )
         return dist
-
+    
     def get_stoch(self, deter):
+        """仅根据 deter (h) 获取 stoch (z) 的模式"""
         x = self._img_out_layers(deter)
         stats = self._suff_stats_layer("ims", x)
         dist = self.get_dist(stats)
         return dist.mode()
 
     def _suff_stats_layer(self, name, x):
+        """根据 hidden 计算分布参数 (logits 或 mean/std)"""
         if self._discrete:
             if name == "ims":
                 x = self._imgs_stat_layer(x)
@@ -437,6 +409,7 @@ class RSSM(nn.Module):
             logit = x.reshape(list(x.shape[:-1]) + [self._stoch, self._discrete])
             return {"logit": logit}
         else:
+            # 连续分布逻辑 (略微复杂，涉及std处理)
             if name == "ims":
                 x = self._imgs_stat_layer(x)
             elif name == "obs":
@@ -444,59 +417,45 @@ class RSSM(nn.Module):
             else:
                 raise NotImplementedError
             mean, std = torch.split(x, [self._stoch] * 2, -1)
+            # ... 激活函数处理 ...
             mean = {
                 "none": lambda: mean,
                 "tanh5": lambda: 5.0 * torch.tanh(mean / 5.0),
             }[self._mean_act]()
             std = {
                 "softplus": lambda: torch.softplus(std),
-                "abs": lambda: torch.abs(std + 1),
-                "sigmoid": lambda: torch.sigmoid(std),
                 "sigmoid2": lambda: 2 * torch.sigmoid(std / 2),
             }[self._std_act]()
             std = std + self._min_std
             return {"mean": mean, "std": std}
 
-    # =========================================================================
-    # 损失函数
-    # =========================================================================
     def kl_loss(self, post, prior, free, dyn_scale, rep_scale):
         """
         计算 KL 散度 Loss。
-        目的：让“闭眼预测 (prior)”尽可能接近“睁眼观察 (post)”。
-        这样以后即使闭着眼 (Imagine)，也能对世界有准确的认知。
+        Goal: 让 Prior (想象) 尽可能接近 Posterior (现实)。
         """
-        
         kld = torchd.kl.kl_divergence
-
-        # sg (stop gradient): 停止梯度传播
-        # Dreamer 算法通常使用这种技巧来分别优化 Representation 和 Dynamics
-        # Representation Loss: 让后验去接近先验（让观察更符合逻辑）
-        # Dynamics Loss: 让先验去接近后验（让预测更符合现实）
         dist = lambda x: self.get_dist(x)
+        # sg = Stop Gradient
         sg = lambda x: {k: v.detach() for k, v in x.items()}
 
-        # 计算两个分布之间的距离
+        # 1. Representation Loss: 让后验去接近先验 (防止后验作弊，只看图不看记忆)
         rep_loss = value = kld(
             dist(post) if self._discrete else dist(post)._dist,
             dist(sg(prior)) if self._discrete else dist(sg(prior))._dist,
         )
+        
+        # 2. Dynamics Loss: 让先验去接近后验 (训练想象能力)
         dyn_loss = kld(
             dist(sg(post)) if self._discrete else dist(sg(post))._dist,
             dist(prior) if self._discrete else dist(prior)._dist,
         )
 
-        # Free bits: 如果误差小于 free (例如 1.0)，就不惩罚。防止模型坍塌。
-        # this is implemented using maximum at the original repo as the gradients are not backpropagated for the out of limits.
+        # Free Bits: 容忍微小的误差，防止后验坍缩
         rep_loss = torch.clip(rep_loss, min=free)
         dyn_loss = torch.clip(dyn_loss, min=free)
-        """
-        # 加权求和
-        # 这个loss值能够同时更新生成post的Encoder
-          以及生成prior的Dynamics
-        """
-        loss = dyn_scale * dyn_loss + rep_scale * rep_loss
 
+        loss = dyn_scale * dyn_loss + rep_scale * rep_loss
         return loss, value, dyn_loss, rep_loss
 
 class MultiEncoder(nn.Module):

@@ -25,58 +25,101 @@ sys.path.append(str(pathlib.Path(__file__).parent))
 to_np = lambda x: x.detach().cpu().numpy()
 
 class LS_Imagine(nn.Module):
+    """
+    LS-Imagine 智能体主类。
+    
+    集成了两篇核心论文的思想：
+    1. LS-Imagine: 通过长短期想象（Long Short-Term Imagination）解决长视距任务。
+    2. Iso-Dream++: 通过解耦可控状态 (s) 和不可控状态 (z) 提高在嘈杂环境下的鲁棒性。
+    """
     def __init__(self, obs_space, act_space, config, logger, dataset):
         super(LS_Imagine, self).__init__()
         self._config = config
         self._logger = logger
+        self._dataset = dataset
+
+        # ---  训练与运行触发器配置 (Triggers) ---
+        # 用于控制何时记录日志、何时训练、何时重置环境等
+        self._step = logger.step // config.action_repeat
+        self._update_count = 0
+
         self._should_log = tool_own.Every(config.log_every)
         batch_steps = config.batch_size * config.batch_length
         self._should_train = tool_own.Every(batch_steps / config.train_ratio)
         self._should_pretrain = tool_own.Once()
         self._should_reset = tool_own.Every(config.reset_every)
         self._should_expl = tool_own.Until(int(config.expl_until / config.action_repeat))
+
+        # --- 用于存储训练过程中的指标--- 
         self._metrics = {}
-        self._step = logger.step // config.action_repeat
-        self._update_count = 0
-        self._dataset = dataset
+
+        #---  初始化核心模块 --- 
         self._wm = model_own.WorldModel(obs_space, act_space, self._step, config)
         self._task_behavior = model_own.ImagBehavior(config, self._wm)
+
+        #性能优化: 编译模型 (Linux下)
         if (
             config.compile and os.name != "nt"
         ):  # compilation is not supported on windows
             self._wm = torch.compile(self._wm)
             self._task_behavior = torch.compile(self._task_behavior)
+
+        # --- 3. 初始化探索策略 (Exploration) ---
+        # 定义奖励函数 lambda，用于探索时的内在奖励计算
         reward = lambda f, s, a: self._wm.heads["reward"](f).mean()
+
         self._expl_behavior = dict(
-            greedy=lambda: self._task_behavior,
-            random=lambda: expl.Random(config, act_space),
+            greedy=lambda: self._task_behavior, # 贪婪策略：直接使用任务策略
+            random=lambda: expl.Random(config, act_space), # 随机策略
             plan2explore=lambda: expl.Plan2Explore(config, self._wm, reward),
         )[config.expl_behavior]().to(self._config.device)
 
     def __call__(self, obs, reset, state=None, training=True):
+        """
+        智能体的主入口函数。
+        
+        流程:
+        1. (如果是训练模式) 检查是否需要从 Replay Buffer 采样数据并更新模型。
+        2. (如果是训练模式) 检查是否需要记录日志。
+        3. 调用 _policy 函数，根据当前观测产生动作。
+        """
         step = self._step
+
+        
         if training:
+            # --- 阶段 A: 训练世界模型与策略 (Training) ---
+            # 决定训练多少步 (预训练阶段 vs 正常训练阶段)
             steps = (
                 self._config.pretrain
                 if self._should_pretrain()
                 else self._should_train(step)
             )
+
             for _ in range(steps):
+                # 从数据集获取一个 Batch
+                # 执行一次梯度更新
                 self._train(next(self._dataset))
+
                 self._update_count += 1
                 self._metrics["update_count"] = self._update_count
 
-            # 2. 日志触发检查 (Logging Check)
+            # --- 阶段 B: 日志记录 (Logging) ---
             if self._should_log(step):
+                # 计算并记录所有指标的平均值
                 for name, values in self._metrics.items():
                     # 重点：计算这段时间所有 Loss 的“平均值” (np.mean)
                     self._logger.scalar(name, float(np.mean(values)))
-                    self._metrics[name] = []
+                    self._metrics[name] = []# 清空缓存
+
+                # 如果开启视频预测日志，记录这一步的预测效果
                 if self._config.video_pred_log:
                     openl = self._wm.video_pred(next(self._dataset))
                     self._logger.video("train_openl", to_np(openl))
+
                 self._logger.write(fps=True)
 
+        # --- 阶段 C: 决策 (Policy Execution) ---
+        # 根据当前观测 obs 和上一时刻的隐状态 state，计算动作 action
         policy_output, state = self._policy(obs, state, training)
 
         if training:
@@ -84,117 +127,201 @@ class LS_Imagine(nn.Module):
             self._logger.step = self._config.action_repeat * self._step
         return policy_output, state
 
+    #服务policy函数
+    def _step_standard(self, latent, action, embed, is_first):
+        """
+        标准的 Dreamer 推演逻辑：单流 RSSM。
+        """
+        # 1. 推演
+        latent, _ = self._wm.dynamics.obs_step(
+            latent, action, embed, is_first
+        )
+        
+        # 2. 评估模式处理
+        if self._config.eval_state_mean:
+            latent["stoch"] = latent["mean"]
+            
+        # 3. 获取特征
+        feat = self._wm.dynamics.get_feat(latent)
+        
+        return latent, feat
+    
+    def _step_iso_dream(self, latent, action, embed, is_first):
+        """
+        Iso-Dream++ 的核心推演逻辑：
+        将状态拆分为 S (可控, Controllable) 和 Z (不可控, Non-controllable)。
+        S 受 action 影响，Z 不受 action 影响。
+        """
+        # 1. 拆分状态 (Split State)
+        if latent is None:
+            latent_s, latent_z = None, None
+        else:
+            # 过滤出不带 'z_' 前缀的作为 S，带 'z_' 前缀的作为 Z
+            latent_s = {k: v for k, v in latent.items() if not k.startswith("z_")}
+            latent_z = {k[2:]: v for k, v in latent.items() if k.startswith("z_")}
+
+        # 2. 分别推演 (Step Dynamics)
+        # S 分支: 输入 action
+        latent_s, _ = self._wm.dynamics_s.obs_step(
+            latent_s, action, embed, is_first
+        )
+        # Z 分支: 忽略 action (传入 None)
+        latent_z, _ = self._wm.dynamics_z.obs_step(
+            latent_z, None, embed, is_first
+        )
+
+        # 3. 评估模式下的均值替代 (Optional)
+        if self._config.eval_state_mean:
+            latent_s["stoch"] = latent_s["mean"]
+            latent_z["stoch"] = latent_z["mean"]
+
+        # 4. 合并状态 (Merge State)
+        # 将 Z 的键加上 'z_' 前缀放回大字典
+        latent = {**latent_s}
+        for k, v in latent_z.items():
+            latent[f"z_{k}"] = v
+        
+        # 5. 获取特征 (Get Features)
+        # WorldModel 内部会自动处理 S 和 Z 特征的拼接
+        feat = self._wm.get_feat(latent)
+        
+        return latent, feat
+
     def _policy(self, obs, state, training):
+        """
+        策略函数：Obs -> Latent State -> Action
+        这里包含了 Iso-Dream++ 的核心逻辑：处理可控与不可控状态。
+        """
+        # 1. 状态初始化
         if state is None:
             latent = action = None
         else:
             latent, action = state
         
-        obs = self._wm.preprocess(obs)
-        embed = self._wm.encoder(obs)
+        # 2. 图像编码 (Observation -> Embedding)
+        # 将像素画面转换为低维特征向量
+        preprocessed_obs = self._wm.preprocess(obs)
+        embed = self._wm.encoder(preprocessed_obs)
 
         # === [修改] 适配 Iso-Dream 双流架构 ===
+        # 3. 世界模型推演 (Embedding + Prev State -> New State)
+        # 根据配置决定使用 Iso-Dream (双流) 还是 标准 (单流) 逻辑
         if self._config.use_iso_dream:
-            # 1. 初始化或拆分状态
-            if latent is None:
-                latent_s = None
-                latent_z = None
-            else:
-                latent_s = {k: v for k, v in latent.items() if not k.startswith("z_")}
-                latent_z = {k[2:]: v for k, v in latent.items() if k.startswith("z_")}
-
-            # 2. 分别执行 obs_step
-            # S 分支 (可控): 输入 action
-            latent_s, _ = self._wm.dynamics_s.obs_step(
-                latent_s, action, embed, obs["is_first"]
-            )
-            # Z 分支 (不可控): action 为 None (或被忽略)
-            latent_z, _ = self._wm.dynamics_z.obs_step(
-                latent_z, None, embed, obs["is_first"]
-            )
-
-            # 3. 处理 eval_state_mean (评估时使用均值代替采样)
-            if self._config.eval_state_mean:
-                latent_s["stoch"] = latent_s["mean"]
-                latent_z["stoch"] = latent_z["mean"]
-
-            # 4. 打包回混合状态 (供下一次迭代使用)
-            latent = {**latent_s}
-            for k, v in latent_z.items():
-                latent[f"z_{k}"] = v
-            
-            # 5. 提取特征 (使用刚刚在 WorldModel 添加的通用方法)
-            feat = self._wm.get_feat(latent)
-
+            latent, feat = self._step_iso_dream(latent, action, embed, preprocessed_obs["is_first"])
         else:
-            # === 原版单流逻辑 ===
-            latent, _ = self._wm.dynamics.obs_step(
-                latent, action, embed, obs["is_first"]
-            )
-            if self._config.eval_state_mean:
-                latent["stoch"] = latent["mean"]
-            feat = self._wm.dynamics.get_feat(latent)
-        # =======================================
+            latent, feat = self._step_standard(latent, action, embed, preprocessed_obs["is_first"])
 
+        # 4. 动作选择 (Actor)
         if not training:
+            # 评估模式：直接使用任务策略的均值/众数 (Deterministic)
             actor = self._task_behavior.actor(feat)
             action = actor.mode()
         elif self._should_expl(self._step):
+            # 探索模式：使用探索策略采样 (Stochastic)
             actor = self._expl_behavior.actor(feat)
             action = actor.sample()
         else:
+            # 训练模式：使用任务策略采样 (Stochastic)
             actor = self._task_behavior.actor(feat)
             action = actor.sample()
             
+        # 5. 后处理与输出
+        # 计算 log 概率用于后续可能的计算
         logprob = actor.log_prob(action)
+
+        # Detach 状态，防止梯度传回到上一时刻 (Truncated BPTT)
         latent = {k: v.detach() for k, v in latent.items()}
         action = action.detach()
         
+        # 如果是 OneHot 动作空间，进行转换
         if self._config.actor["dist"] == "onehot_gumble":
             action = torch.one_hot(
                 torch.argmax(action, dim=-1), self._config.num_actions
             )
             
         policy_output = {"action": action, "logprob": logprob}
-        state = (latent, action)
-        return policy_output, state
+
+        # 返回 (隐状态, 动作) 作为下一时刻的 recurrent state
+        new_state = (latent, action)
+
+        return policy_output, new_state
 
     def _train(self, data):
+        """
+        核心训练循环。
+        
+        包含：
+        1. 训练 World Model (表征学习 + 动力学学习)
+        2. 训练 Actor-Critic (行为学习)
+        """
         metrics = {}
+
+        # --- 1. 训练 World Model ---
+        # post: 后验状态 (Posterior)
+        # post_zoomed: LS-Imagine 特有的缩放后状态 (用于长视距预测)
+        # context: 上下文信息
         post, post_zoomed, context, mets = self._wm._train(data)
         metrics.update(mets)
 
-        # [修改] 使用 self._wm.get_feat(s) 替代 self._wm.dynamics.get_feat(s)
-        # 这样就能自动处理 Iso-Dream 的混合状态了
+        # --- 2. 定义 Head 访问器 (Lambdas) ---
+        # 为了配合 _task_behavior._train 的接口，我们需要定义如何从特征获取预测值
+        # f: features, s: state, a: action
+
+        start_state = post # 训练起点的状态
+
+        # 奖励 (Reward)
         reward = lambda f, s, a: self._wm.heads["reward"](
             self._wm.get_feat(s) 
         ).mode()
 
+        # 内在奖励 (Intrinsic Reward - 如 CLIP score)
         intrinsic = lambda f, s, a: self._wm.heads["intrinsic"](
             self._wm.get_feat(s)
         ).mode() 
 
+        # 跳跃步数 (Jumping Steps - LS-Imagine 核心)
+        # 预测从当前状态跳跃到未来某个高价值状态需要的步数
         jumping_steps = lambda f, s, a: self._wm.heads["jumping_steps"](
             f
         ).mean().clamp_min(1).int()
 
+        # 累积奖励 (Accumulated Reward)
+        # 预测跳跃区间的总奖励
         accumulated_reward = lambda f, s, a: self._wm.heads["accumulated_reward"](
             f
         ).mode()
 
+        # 跳跃指示器 (Jump Indicator)
+        # 决定当前状态是否适合进行长视距跳跃
         jump_indicator = lambda s: self._wm.heads["jump"](
             self._wm.get_feat(s)
         ).mean
 
+        # 终止预测 (End/Done)
         is_end = lambda s: self._wm.heads["end"](
             self._wm.get_feat(s)
         ).mean
 
-        #行为学习
-        metrics.update(self._task_behavior._train(post, post_zoomed, reward, intrinsic, jumping_steps, accumulated_reward, jump_indicator, is_end)[-1])
+        # --- 3. 训练 Behavior (Actor-Critic) ---
+        # 在 World Model 的想象中训练策略
+        behavior_metrics = self._task_behavior._train(
+            start_state, 
+            post_zoomed, 
+            reward, 
+            intrinsic, 
+            jumping_steps, 
+            accumulated_reward, 
+            jump_indicator, 
+            is_end
+        )[-1] 
+        metrics.update(behavior_metrics)
+
+        # --- 4. 训练 Exploration (可选) ---
         if self._config.expl_behavior != "greedy":
             mets = self._expl_behavior.train(post, context, data)[-1]
             metrics.update({"expl_" + key: value for key, value in mets.items()})
+
+        # --- 5. 更新历史指标 ---
         for name, value in metrics.items():
             if not name in self._metrics.keys():
                 self._metrics[name] = [value]
