@@ -61,7 +61,7 @@ class RSSM(nn.Module):
         self._std_act = std_act
         self._unimix_ratio = unimix_ratio
         self._initial = initial
-        self._num_actions = num_actions + 1 # +1 是因为有时会填充一个空动作
+        self._num_actions = num_actions + 1 # +1 jUMP BIT
         self._embed = embed
         self._device = device
 
@@ -74,17 +74,13 @@ class RSSM(nn.Module):
         # --- [修正] 维度计算逻辑 ---
         if self._action_free:
             # Z分支 (不可控): 不接收动作，所以没有 num_actions，也没有 +1
-            if self._discrete:
-                inp_dim = self._stoch * self._discrete
-            else:
-                inp_dim = self._stoch
+            inp_dim = self._stoch * self._discrete
+
         else:
             # S分支 (可控): 接收动作
             # 必须加上 LS-Imagine 特有的 "+1" (因为 preprocess 里拼接了 extra dim)
-            if self._discrete:
-                inp_dim = self._stoch * self._discrete + (num_actions or 0) + 1
-            else:
-                inp_dim = self._stoch + (num_actions or 0) + 1
+            inp_dim = self._stoch * self._discrete + (num_actions or 0) + 1
+
         # -------------------------
         
         inp_layers.append(nn.Linear(inp_dim, self._hidden, bias=False))
@@ -136,19 +132,14 @@ class RSSM(nn.Module):
         # 作用：把上面神经网络输出的 hidden features 映射成概率分布的参数 (logits 或 mean/std)
         # 分别用于生成“想象的 z” (imgs_stat) 和 “观察到的 z” (obs_stat)
         """
-        if self._discrete:
-            self._imgs_stat_layer = nn.Linear(
-                self._hidden, self._stoch * self._discrete
-            )
-            self._imgs_stat_layer.apply(tools.uniform_weight_init(1.0))
-            self._obs_stat_layer = nn.Linear(self._hidden, self._stoch * self._discrete)
-            self._obs_stat_layer.apply(tools.uniform_weight_init(1.0))
-        # ... 连续分布的处理 ...
-        else:
-            self._imgs_stat_layer = nn.Linear(self._hidden, 2 * self._stoch)
-            self._imgs_stat_layer.apply(tools.uniform_weight_init(1.0))
-            self._obs_stat_layer = nn.Linear(self._hidden, 2 * self._stoch)
-            self._obs_stat_layer.apply(tools.uniform_weight_init(1.0))
+
+        self._imgs_stat_layer = nn.Linear(
+            self._hidden, self._stoch * self._discrete
+        )
+        self._imgs_stat_layer.apply(tools.uniform_weight_init(1.0))
+        self._obs_stat_layer = nn.Linear(self._hidden, self._stoch * self._discrete)
+        self._obs_stat_layer.apply(tools.uniform_weight_init(1.0))
+
 
         if self._initial == "learned":
             self.W = torch.nn.Parameter(
@@ -163,23 +154,17 @@ class RSSM(nn.Module):
         # ... 初始化 h_0 ...
         deter = torch.zeros(batch_size, self._deter).to(self._device)
         # ... 初始化 z_0 ...
-        if self._discrete:
-            state = dict(
-                logit=torch.zeros([batch_size, self._stoch, self._discrete]).to(
-                    self._device
-                ),
-                stoch=torch.zeros([batch_size, self._stoch, self._discrete]).to(
-                    self._device
-                ),
-                deter=deter,
-            )
-        else:
-            state = dict(
-                mean=torch.zeros([batch_size, self._stoch]).to(self._device),
-                std=torch.zeros([batch_size, self._stoch]).to(self._device),
-                stoch=torch.zeros([batch_size, self._stoch]).to(self._device),
-                deter=deter,
-            )
+
+        state = dict(
+            logit=torch.zeros([batch_size, self._stoch, self._discrete]).to(
+                self._device
+            ),
+            stoch=torch.zeros([batch_size, self._stoch, self._discrete]).to(
+                self._device
+            ),
+            deter=deter,
+        )
+
         if self._initial == "zeros":
             return state
         elif self._initial == "learned":
@@ -348,10 +333,9 @@ class RSSM(nn.Module):
         prev_stoch = prev_state["stoch"]
         
         # 1. 如果是离散状态，展平特征
-        if self._discrete:
-            # 确保 shape 逻辑正确
-            shape = list(prev_stoch.shape[:-2]) + [self._stoch * self._discrete]
-            prev_stoch = prev_stoch.reshape(shape)
+        # 确保 shape 逻辑正确
+        shape = list(prev_stoch.shape[:-2]) + [self._stoch * self._discrete]
+        prev_stoch = prev_stoch.reshape(shape)
         
         # 2. 根据分支类型决定输入内容
         if self._action_free:
@@ -398,9 +382,8 @@ class RSSM(nn.Module):
         这是为了给下游的 Actor/Critic 网络提供完整的信息。
         """
         stoch = state["stoch"]
-        if self._discrete:
-            shape = list(stoch.shape[:-2]) + [self._stoch * self._discrete]
-            stoch = stoch.reshape(shape)
+        shape = list(stoch.shape[:-2]) + [self._stoch * self._discrete]
+        stoch = stoch.reshape(shape)
         return torch.cat([stoch, state["deter"]], -1)
 
     def get_dist(self, state, dtype=None):
@@ -408,16 +391,11 @@ class RSSM(nn.Module):
         把神经网络输出的 logits 转换成 PyTorch 的分布对象。
         方便计算 entropy (熵) 或 log_prob (对数概率)。
         """
-        if self._discrete:
-            logit = state["logit"]
-            dist = torchd.independent.Independent(
-                tools.OneHotDist(logit, unimix_ratio=self._unimix_ratio), 1
-            )
-        else:
-            mean, std = state["mean"], state["std"]
-            dist = tools.ContDist(
-                torchd.independent.Independent(torchd.normal.Normal(mean, std), 1)
-            )
+        logit = state["logit"]
+        dist = torchd.independent.Independent(
+            tools.OneHotDist(logit, unimix_ratio=self._unimix_ratio), 1
+        )
+
         return dist
 
     def get_stoch(self, deter):
@@ -427,35 +405,15 @@ class RSSM(nn.Module):
         return dist.mode()
 
     def _suff_stats_layer(self, name, x):
-        if self._discrete:
-            if name == "ims":
-                x = self._imgs_stat_layer(x)
-            elif name == "obs":
-                x = self._obs_stat_layer(x)
-            else:
-                raise NotImplementedError
-            logit = x.reshape(list(x.shape[:-1]) + [self._stoch, self._discrete])
-            return {"logit": logit}
+        if name == "ims":
+            x = self._imgs_stat_layer(x)
+        elif name == "obs":
+            x = self._obs_stat_layer(x)
         else:
-            if name == "ims":
-                x = self._imgs_stat_layer(x)
-            elif name == "obs":
-                x = self._obs_stat_layer(x)
-            else:
-                raise NotImplementedError
-            mean, std = torch.split(x, [self._stoch] * 2, -1)
-            mean = {
-                "none": lambda: mean,
-                "tanh5": lambda: 5.0 * torch.tanh(mean / 5.0),
-            }[self._mean_act]()
-            std = {
-                "softplus": lambda: torch.softplus(std),
-                "abs": lambda: torch.abs(std + 1),
-                "sigmoid": lambda: torch.sigmoid(std),
-                "sigmoid2": lambda: 2 * torch.sigmoid(std / 2),
-            }[self._std_act]()
-            std = std + self._min_std
-            return {"mean": mean, "std": std}
+            raise NotImplementedError
+        logit = x.reshape(list(x.shape[:-1]) + [self._stoch, self._discrete])
+        return {"logit": logit}
+
 
     # =========================================================================
     # 损失函数

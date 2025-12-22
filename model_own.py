@@ -168,12 +168,10 @@ class WorldModel(nn.Module):
             )
 
             # --- 计算特征维度 (S + Z) ---
-            if config.dyn_discrete:
-                feat_s = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
-                feat_z = config.dyn_stoch_z * config.dyn_discrete + config.dyn_deter_z
-            else:
-                feat_s = config.dyn_stoch + config.dyn_deter
-                feat_z = config.dyn_stoch_z + config.dyn_deter_z
+
+            feat_s = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
+            feat_z = config.dyn_stoch_z * config.dyn_discrete + config.dyn_deter_z
+
             
             # [关键] 保存总维度 (例如 5120 + 1536 = 6656)
             self.feat_size = feat_s + feat_z
@@ -204,10 +202,7 @@ class WorldModel(nn.Module):
                 action_free=False
             )
             
-            if config.dyn_discrete:
-                self.feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
-            else:
-                self.feat_size = config.dyn_stoch + config.dyn_deter
+            self.feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
 
         # === 3. 初始化通用 Heads ===
         # [关键修复] 所有 Head 必须使用 self.feat_size (6656)，而不是重新计算单流维度
@@ -826,16 +821,11 @@ class ImagBehavior(nn.Module):
             feat_size = world_model.feat_size
         else:
             # 如果 WorldModel 还没初始化完 (防御性代码)，手动重新计算
-            if config.dyn_discrete:
-                feat_s = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
-            else:
-                feat_s = config.dyn_stoch + config.dyn_deter
-            
+            feat_s = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
+
             if config.use_iso_dream:
-                if config.dyn_discrete:
-                    feat_z = config.dyn_stoch_z * config.dyn_discrete + config.dyn_deter_z
-                else:
-                    feat_z = config.dyn_stoch_z + config.dyn_deter_z
+
+                feat_z = config.dyn_stoch_z * config.dyn_discrete + config.dyn_deter_z
                 feat_size = feat_s + feat_z
             else:
                 feat_size = feat_s

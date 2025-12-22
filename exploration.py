@@ -45,12 +45,10 @@ class Plan2Explore(nn.Module):
         self._reward = reward
         self._behavior = models.ImagBehavior(config, world_model)
         self.actor = self._behavior.actor
-        if config.dyn_discrete:
-            feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
-            stoch = config.dyn_stoch * config.dyn_discrete
-        else:
-            feat_size = config.dyn_stoch + config.dyn_deter
-            stoch = config.dyn_stoch
+
+        feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
+        stoch = config.dyn_stoch * config.dyn_discrete
+
         size = {
             "embed": world_model.embed_size,
             "stoch": stoch,
