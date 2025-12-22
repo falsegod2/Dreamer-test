@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from torch import distributions as torchd
 
-import models
+import model_own
 import networks
 import tools
 
@@ -43,7 +43,7 @@ class Plan2Explore(nn.Module):
         self._config = config
         self._use_amp = True if config.precision == 16 else False
         self._reward = reward
-        self._behavior = models.ImagBehavior(config, world_model)
+        self._behavior = model_own.ImagBehavior(config, world_model)
         self.actor = self._behavior.actor
 
         feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
