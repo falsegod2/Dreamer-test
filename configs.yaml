@@ -8,6 +8,7 @@ defaults:
   enable_cloud_backup: False   # 是否开启云盘备份 (默认为 False，本地跑的时候就不报错了)
   cloud_backup_interval: 7200  # 备份间隔时间，单位为秒 (7200秒 = 2小时)
 
+  inverse_loss_scale: 1.0
   logdir: null
   traindir: null
   evaldir: null
