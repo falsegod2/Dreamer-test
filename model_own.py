@@ -588,34 +588,24 @@ class ImagBehavior(nn.Module):
 
                     # 2. 想象循环 (Imagination Horizon)
                     for _ in range (self._config.imag_horizon - 1):
-                        # 获取当前末端状态
-                        checking_state = {} 
-                        for key, tensor in imag_state.items():
-                            checking_state[key] = tensor[-1, :, ...]
+                        # 获取当前步骤状态
+                        checking_state = {key: tensor[-1] for key, tensor in imag_state.items()}
+                        jump_tensor = jump_indicator(checking_state)
+                        end_factor = is_end(checking_state)
+                        indices = probability_to_bool(jump_tensor * (1.0 - end_factor), self.jump_prob).squeeze()
+                        jump_record = torch.cat((jump_record, indices.unsqueeze(0)), dim=0)
 
-                        # 判定是否执行跳跃
-                        jump_tensor = jump_indicator(checking_state) 
-                        end_factor = is_end(checking_state) 
-                        
-                        # 生成跳跃掩码：只有未结束且满足概率时才跳跃
-                        indices = probability_to_bool(jump_tensor * (1.0 - end_factor), self.jump_prob).squeeze() 
-                        jump_record = torch.cat((jump_record, indices.unsqueeze(0)), dim=0) 
-
-                        if indices.any():
-                            # 提取需要跳跃的状态子集
-                            jump_state = {key: tensor[indices] for key, tensor in checking_state.items()}
-                            # A. 执行长时跳转 (仅受控分支真正跳跃)
-                            _, state_after_jumping, _ = self._jumpy(jump_state, self.actor, 1)
-                            # 紧接着执行一步普通想象以平滑状态
-                            _, state_after_jumping, _ = self._imagine(state_after_jumping, self.actor, 1)
-
-                        # B. 执行常规短时想象 (所有状态)
+                        # --- 常规短时想象 (所有样本) ---
                         _, state_after_imagination, ac = self._imagine(checking_state, self.actor, 1)
                         imag_action = torch.cat((imag_action, ac.unsqueeze(0)), dim=0)
-    
-                        # 将跳跃后的结果覆盖到原本的短时想象结果中
-                        # 修改点：同样增加判断，只在有跳转发生时进行状态覆盖
+
+                        # --- 跳转逻辑 (仅在有样本满足条件时执行) ---
                         if indices.any():
+                            jump_state = {key: tensor[indices] for key, tensor in checking_state.items()}
+                            _, state_after_jumping, _ = self._jumpy(jump_state, self.actor, 1)
+                            _, state_after_jumping, _ = self._imagine(state_after_jumping, self.actor, 1)
+                            
+                            # 只有发生跳转的样本才覆盖状态
                             for key in state_after_imagination:
                                 state_after_imagination[key][indices] = state_after_jumping[key]
 

@@ -168,16 +168,27 @@ class RSSM(nn.Module):
         return post, prior
 
     def img_step(self, prev_state, prev_action, sample=True):
-        # 1. 受控分支演化 (带动作)
+        # --- 受控分支演化 (s) ---
         prev_s = prev_state["stoch_s"]
-        if self._discrete: prev_s = prev_s.reshape(list(prev_s.shape[:-2]) + [-1])
-        x_s, deter_s = self._cell_s(self._img_in_s(torch.cat([prev_s, prev_action], -1)), [prev_state["deter_s"]])
+        if self._discrete:
+            # 修复点：显式指定维度
+            s_dim = self._stoch_s * self._discrete
+            if prev_s.numel() > 0:
+                prev_s = prev_s.reshape(list(prev_s.shape[:-2]) + [s_dim])
+        
+        # 确保 prev_action 与 prev_s 形状对齐（处理空 Batch 情况）
+        x_s = torch.cat([prev_s, prev_action], -1)
+        x_s, deter_s = self._cell_s(self._img_in_s(x_s), [prev_state["deter_s"]])
         stats_s = self._suff_stats_layer(self._stat_s_img, self._img_out_s(x_s), self._stoch_s)
         stoch_s = self.get_dist(stats_s).sample() if sample else self.get_dist(stats_s).mode()
 
-        # 2. 非受控分支演化 (无动作)
+        # --- 非受控分支演化 (z) ---
         prev_z = prev_state["stoch_z"]
-        if self._discrete: prev_z = prev_z.reshape(list(prev_z.shape[:-2]) + [-1])
+        if self._discrete:
+            z_dim = self._stoch_z * self._discrete
+            if prev_z.numel() > 0:
+                prev_z = prev_z.reshape(list(prev_z.shape[:-2]) + [z_dim])
+            
         x_z, deter_z = self._cell_z(self._img_in_z(prev_z), [prev_state["deter_z"]])
         stats_z = self._suff_stats_layer(self._stat_z_img, self._img_out_z(x_z), self._stoch_z)
         stoch_z = self.get_dist(stats_z).sample() if sample else self.get_dist(stats_z).mode()
@@ -201,14 +212,25 @@ class RSSM(nn.Module):
         return tools.ContDist(torchd.independent.Independent(torchd.normal.Normal(stats["mean"], stats["std"]), 1))
 
     def get_feat(self, state):
-        s_stoch = state["stoch_s"]
-        z_stoch = state["stoch_z"]
+        # 确保 state 是字典且包含必要的键，增加容错性
+        s_stoch = state.get("stoch_s", torch.tensor([]).to(self._device))
+        z_stoch = state.get("stoch_z", torch.tensor([]).to(self._device))
+        deter_s = state.get("deter_s", torch.tensor([]).to(self._device))
+        deter_z = state.get("deter_z", torch.tensor([]).to(self._device))
+
         if self._discrete:
-            # 修改点：将 -1 替换为明确的维度乘积 [stoch_dim * discrete_num]
-            # 这样即使 Batch 维度为 0，PyTorch 也能通过明确的末尾维度正常处理
-            s_stoch = s_stoch.reshape(list(s_stoch.shape[:-2]) + [self._stoch_s * self._discrete])
-            z_stoch = z_stoch.reshape(list(z_stoch.shape[:-2]) + [self._stoch_z * self._discrete])
-        return torch.cat([s_stoch, state["deter_s"], z_stoch, state["deter_z"]], -1)
+            # 修复点：显式计算维度 [stoch_dim * discrete_num]，不再使用 -1
+            s_dim = self._stoch_s * self._discrete
+            z_dim = self._stoch_z * self._discrete
+            
+            # 只有在非空时才进行 reshape
+            if s_stoch.numel() > 0:
+                s_stoch = s_stoch.reshape(list(s_stoch.shape[:-2]) + [s_dim])
+            if z_stoch.numel() > 0:
+                z_stoch = z_stoch.reshape(list(z_stoch.shape[:-2]) + [z_dim])
+        
+        # 即使是空 Tensor，只要最后一维对齐，cat 就能成功
+        return torch.cat([s_stoch, deter_s, z_stoch, deter_z], -1)
 
     def kl_loss(self, post, prior, free, dyn_scale, rep_scale):
         # 适配双分支的 KL 损失计算
