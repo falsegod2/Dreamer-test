@@ -201,11 +201,14 @@ class RSSM(nn.Module):
         return tools.ContDist(torchd.independent.Independent(torchd.normal.Normal(stats["mean"], stats["std"]), 1))
 
     def get_feat(self, state):
-        s_s, z_s = state["stoch_s"], state["stoch_z"]
+        s_stoch = state["stoch_s"]
+        z_stoch = state["stoch_z"]
         if self._discrete:
-            s_s = s_s.reshape(list(s_s.shape[:-2]) + [-1])
-            z_s = z_s.reshape(list(z_s.shape[:-2]) + [-1])
-        return torch.cat([s_s, state["deter_s"], z_s, state["deter_z"]], -1)
+            # 修改点：将 -1 替换为明确的维度乘积 [stoch_dim * discrete_num]
+            # 这样即使 Batch 维度为 0，PyTorch 也能通过明确的末尾维度正常处理
+            s_stoch = s_stoch.reshape(list(s_stoch.shape[:-2]) + [self._stoch_s * self._discrete])
+            z_stoch = z_stoch.reshape(list(z_stoch.shape[:-2]) + [self._stoch_z * self._discrete])
+        return torch.cat([s_stoch, state["deter_s"], z_stoch, state["deter_z"]], -1)
 
     def kl_loss(self, post, prior, free, dyn_scale, rep_scale):
         # 适配双分支的 KL 损失计算
