@@ -508,260 +508,239 @@ class ImagBehavior(nn.Module):
         self._use_amp = True if config.precision == 16 else False
         self._config = config
         self.jump_prob = config.jump_prob
+        # 预计算折扣因子的累加和，用于长时奖励修正
         self.gamma_sum = [(1 - self._config.discount ** (i + 1)) / (1 - self._config.discount) for i in range(self._config.episode_max_steps)]
         self.gamma_sum = torch.tensor(self.gamma_sum, dtype=torch.float32, device=config.device)
 
         self._world_model = world_model
+        
+        # 这里的 feat_size 必须与 RSSM.get_feat() 返回的维度一致
+        # 即 (stoch_s + deter_s + stoch_z + deter_z) 的总和
         if config.dyn_discrete:
             feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
         else:
             feat_size = config.dyn_stoch + config.dyn_deter
+            
         self.actor = networks.MLP(
-            feat_size,
-            (config.num_actions,),
-            config.actor["layers"],
-            config.units,
-            config.act,
-            config.norm,
-            config.actor["dist"],
-            config.actor["std"],
-            config.actor["min_std"],
-            config.actor["max_std"],
-            absmax=1.0,
-            temp=config.actor["temp"],
-            unimix_ratio=config.actor["unimix_ratio"],
-            outscale=config.actor["outscale"],
-            name="Actor",
+            feat_size, (config.num_actions,), config.actor["layers"], config.units,
+            config.act, config.norm, config.actor["dist"], config.actor["std"],
+            config.actor["min_std"], config.actor["max_std"], absmax=1.0,
+            temp=config.actor["temp"], unimix_ratio=config.actor["unimix_ratio"],
+            outscale=config.actor["outscale"], name="Actor",
         )
         self.value = networks.MLP(
-            feat_size,
-            (255,) if config.critic["dist"] == "symlog_disc" else (),
-            config.critic["layers"],
-            config.units,
-            config.act,
-            config.norm,
-            config.critic["dist"],
-            outscale=config.critic["outscale"],
-            device=config.device,
-            name="Value",
+            feat_size, (255,) if config.critic["dist"] == "symlog_disc" else (),
+            config.critic["layers"], config.units, config.act, config.norm,
+            config.critic["dist"], outscale=config.critic["outscale"],
+            device=config.device, name="Value",
         )
+        
         if config.critic["slow_target"]:
             self._slow_value = copy.deepcopy(self.value)
             self._updates = 0
+            
         kw = dict(wd=config.weight_decay, opt=config.opt, use_amp=self._use_amp)
-        self._actor_opt = tools.Optimizer(
-            "actor",
-            self.actor.parameters(),
-            config.actor["lr"],
-            config.actor["eps"],
-            config.actor["grad_clip"],
-            **kw,
-        )
-        print(
-            f"Optimizer actor_opt has {sum(param.numel() for param in self.actor.parameters())} variables."
-        )
-        self._value_opt = tools.Optimizer(
-            "value",
-            self.value.parameters(),
-            config.critic["lr"],
-            config.critic["eps"],
-            config.critic["grad_clip"],
-            **kw,
-        )
-        print(
-            f"Optimizer value_opt has {sum(param.numel() for param in self.value.parameters())} variables."
-        )
+        self._actor_opt = tools.Optimizer("actor", self.actor.parameters(), config.actor["lr"], config.actor["eps"], config.actor["grad_clip"], **kw)
+        self._value_opt = tools.Optimizer("value", self.value.parameters(), config.critic["lr"], config.critic["eps"], config.critic["grad_clip"], **kw)
+        
         if self._config.reward_EMA:
-            # register ema_vals to nn.Module for enabling torch.save and torch.load
             self.register_buffer("ema_vals", torch.zeros((2,)).to(self._config.device))
             self.reward_ema = RewardEMA(device=self._config.device)
 
     def _train(
-        self,
-        start,
-        start_zoomed,
-        objective,
-        intrinsic_objective,
-        jumping_steps_predictor,
-        accumulated_reward_predictor,
-        jump_indicator,
-        is_end,
-    ):
+            self,
+            start,
+            start_zoomed,
+            objective,
+            intrinsic_objective,
+            jumping_steps_predictor,
+            accumulated_reward_predictor,
+            jump_indicator,
+            is_end,
+        ):
+            self._update_slow_target()
+            metrics = {}
 
-        self._update_slow_target()
-        metrics = {}
+            with tools.RequiresGrad(self.actor):
+                with torch.cuda.amp.autocast(self._use_amp):
+                    # 1. 展平并合并初始状态
+                    flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
+                    start = {k: flatten(v) for k, v in start.items()} 
+                    
+                    if start_zoomed is not None and self.jump_prob > 0.0:
+                        start_zoomed = {k: flatten(v) for k, v in start_zoomed.items()}
+                        for k, v in start.items():
+                            start[k] = torch.cat((v, start_zoomed[k]), dim=0)
 
-        with tools.RequiresGrad(self.actor):
-            with torch.cuda.amp.autocast(self._use_amp):
-                # add post-jump state to start
-                flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
-                start = {k: flatten(v) for k, v in start.items()} # [512, xx, xx]
-                if start_zoomed is not None and self.jump_prob > 0.0:
-                    start_zoomed = {k: flatten(v) for k, v in start_zoomed.items()} # [n, xx, xx]
+                    # --- 修复点：使用 deter_s 获取并行序列数量 ---
+                    state_num = start['deter_s'].shape[0] 
+
+                    imag_state = {} 
                     for k, v in start.items():
-                        start[k] = torch.cat((v, start_zoomed[k]), dim=0) # shape: [N = 512 + n, xx, xx]
+                        imag_state[k] = v.unsqueeze(0) 
 
-                state_num = start['deter'].shape[0] # 512 or N
+                    # 获取动作维度用于初始化记录张量
+                    action_example = self.actor(self._world_model.dynamics.get_feat(start).detach()).sample()
+                    action_dimension = action_example.shape[-1]
 
-                imag_state = {} # [L, N, xx, xx]
-                for k, v in start.items():
-                    imag_state[k] = v.unsqueeze(0) # [1, N, xx, xx]
+                    jump_record = torch.empty((0, state_num), device=self._config.device) 
+                    imag_action = torch.empty((0, state_num, action_dimension), device=self._config.device) 
 
-                action_example = self.actor(self._world_model.dynamics.get_feat(start).detach()).sample()
-                action_dimension = action_example.shape[-1]
+                    # 2. 想象循环 (Imagination Horizon)
+                    for _ in range (self._config.imag_horizon - 1):
+                        # 获取当前末端状态
+                        checking_state = {} 
+                        for key, tensor in imag_state.items():
+                            checking_state[key] = tensor[-1, :, ...]
 
-                jump_record = torch.empty((0, state_num), device=self._config.device) # [0, N]
-                imag_action = torch.empty((0, state_num, action_dimension), device=self._config.device) # [0, N, xx]
+                        # 判定是否执行跳跃
+                        jump_tensor = jump_indicator(checking_state) 
+                        end_factor = is_end(checking_state) 
+                        
+                        # 生成跳跃掩码：只有未结束且满足概率时才跳跃
+                        indices = probability_to_bool(jump_tensor * (1.0 - end_factor), self.jump_prob).squeeze() 
+                        jump_record = torch.cat((jump_record, indices.unsqueeze(0)), dim=0) 
 
-                for _ in range (self._config.imag_horizon - 1):
-                    checking_state = {} # [N, xx, xx]
+                        # 提取需要跳跃的状态子集
+                        jump_state = {key: tensor[indices] for key, tensor in checking_state.items()}
+
+                        # A. 执行长时跳转 (仅受控分支真正跳跃)
+                        _, state_after_jumping, _ = self._jumpy(jump_state, self.actor, 1)
+                        # 紧接着执行一步普通想象以平滑状态
+                        _, state_after_jumping, _ = self._imagine(state_after_jumping, self.actor, 1)
+
+                        # B. 执行常规短时想象 (所有状态)
+                        _, state_after_imagination, ac = self._imagine(checking_state, self.actor, 1)
+
+                        imag_action = torch.cat((imag_action, ac.unsqueeze(0)), dim=0)
+    
+                        # 将跳跃后的结果覆盖到原本的短时想象结果中
+                        for key in state_after_imagination:
+                            state_after_imagination[key][indices] = state_after_jumping[key]
+
+                        # 更新想象序列
+                        for key in imag_state:
+                            imag_state[key] = torch.cat((imag_state[key], state_after_imagination[key].unsqueeze(0)), dim=0)
+
+                    # 补全最后一步记录
+                    last_jump_record = torch.zeros((1, state_num), device=self._config.device) 
+                    jump_record = torch.cat((jump_record, last_jump_record), dim=0) 
+
+                    # 3. 计算特征与动作
+                    imag_feat = self._world_model.dynamics.get_feat(imag_state) 
+                    inp = imag_feat[-1].detach()
+                    last_imag_action = self.actor(inp).sample() 
+                    imag_action = torch.cat((imag_action, last_imag_action.unsqueeze(0)), dim=0) 
+
+                    # 4. 数据增强 (Data Augmentation) 逻辑
+                    new_state = {}
+                    new_jump_tensor = jump_indicator(imag_state) 
+                    new_end_factor = is_end(imag_state) 
+                    zoom_indices = new_jump_tensor * (1.0 - new_end_factor)
+
+                    max_values, _ = zoom_indices.max(dim=0, keepdim=True)
+                    max_mask = (zoom_indices == max_values)
+                    zoom_indices *= max_mask.float()
+                    zoom_indices = probability_to_bool(zoom_indices, self.jump_prob).squeeze() 
+
+                    new_num = torch.sum(zoom_indices) 
                     for key, tensor in imag_state.items():
-                        checking_state[key] = tensor[-1, :, ...]
+                        new_state[key] = tensor[zoom_indices] 
 
-                    # check if checking_state can jump
-                    jump_tensor = jump_indicator(checking_state) # [N, 1]
-                    end_factor = is_end(checking_state) # [N, 1]
-                    indices = probability_to_bool(jump_tensor * (1.0 - end_factor), self.jump_prob).squeeze() # [N]
-                    jump_record = torch.cat((jump_record, indices.unsqueeze(0)), dim=0) # [L, N]
+                    _, new_state_after_jump, _ = self._jumpy(new_state, self.actor, 1) 
+                    _, new_state_after_jump, _ = self._imagine(new_state_after_jump, self.actor, 1) 
+                    new_feat, new_state_sequence, new_action = self._imagine(
+                        new_state_after_jump, self.actor, self._config.imag_horizon
+                    ) 
 
-                    jump_state = {} # [X, xx, xx]
-                    for key, tensor in checking_state.items():
-                        jump_state[key] = tensor[indices]
+                    # 合并增强序列
+                    new_jump_record = torch.zeros((self._config.imag_horizon, new_num), device=self._config.device) 
+                    for key, tensor in imag_state.items():
+                        imag_state[key] = torch.cat((tensor, new_state_sequence[key]), dim=1) 
 
-                    # for states identified as requiring a jumpy transition, execute long-term imagination.
-                    _, state_after_jumping, _ = self._jumpy(
-                        jump_state, self.actor, 1
+                    imag_feat = torch.cat((imag_feat, new_feat), dim=1) 
+                    imag_action = torch.cat((imag_action, new_action), dim=1) 
+                    jump_record = torch.cat((jump_record, new_jump_record), dim=1) 
+
+                    # 5. 奖励计算与策略更新
+                    reward = objective(imag_feat, imag_state, imag_action)
+                    intrinsic_reward = intrinsic_objective(imag_feat, imag_state, imag_action)
+                    reward += intrinsic_reward
+
+                    actor_ent = self.actor(imag_feat).entropy() 
+
+                    # 计算目标价值 (Lambda-return)
+                    target, weights, base = self._compute_target(
+                        imag_feat, imag_state, reward, jump_record.unsqueeze(-1), 
+                        jumping_steps_predictor, accumulated_reward_predictor, is_end
                     )
 
-                    _, state_after_jumping, _ = self._imagine(
-                        state_after_jumping, self.actor, 1
-                    ) # [X, xx, xx]
+                    # 计算 Actor 损失
+                    actor_loss, mets = self._compute_actor_loss(
+                        imag_feat, imag_action, target, weights, base, jump_record.unsqueeze(-1)
+                    )
 
-                    # For other states, execute short-term imagination.
-                    _, state_after_imagination, ac = self._imagine(
-                        checking_state, self.actor, 1
-                    ) # [N, xx, xx]
+                    actor_loss -= self._config.actor["entropy"] * actor_ent[:-1, ..., None]
+                    actor_loss = torch.mean(actor_loss)
+                    metrics.update(mets)
+                    value_input = imag_feat
 
-                    # save action for this step to imag_action
-                    imag_action = torch.cat((imag_action, ac.unsqueeze(0)), dim=0)
- 
-                    for key in state_after_imagination:
-                        state_after_imagination[key][indices] = state_after_jumping[key]
+            # 6. Value 网络更新
+            with tools.RequiresGrad(self.value):
+                with torch.cuda.amp.autocast(self._use_amp):
+                    value = self.value(value_input[:-1].detach())
+                    target = torch.stack(target, dim=1)
+                    value_loss = -value.log_prob(target.detach())
+                    if self._config.critic["slow_target"]:
+                        slow_target = self._slow_value(value_input[:-1].detach())
+                        value_loss -= value.log_prob(slow_target.mode().detach())
+                    value_loss = torch.mean(weights[:-1] * value_loss[:, :, None])
 
-                    for key in imag_state:
-                        imag_state[key] = torch.cat((imag_state[key], state_after_imagination[key].unsqueeze(0)), dim=0)
-
-
-                last_jump_record = torch.zeros((1, state_num), device=self._config.device) # [1, N]
-                jump_record = torch.cat((jump_record, last_jump_record), dim=0) # [L, N]
-                jump_num = torch.sum(jump_record)
-
-                imag_feat = self._world_model.dynamics.get_feat(imag_state) # [L, N, xx, xx]
-                inp = imag_feat[-1].detach()
-                last_imag_action = self.actor(inp).sample() # [N, xx, xx]
-                imag_action = torch.cat((imag_action, last_imag_action.unsqueeze(0)), dim=0) # [L, N, xx]
-
-                #  Data augmentation (using the state after long-term transition as the starting point for a new imagination sequence)
-                new_state = {}
-
-                new_jump_tensor = jump_indicator(imag_state) # [L, N, 1]
-                new_end_factor = is_end(imag_state) # [L, N, 1]
-                zoom_indices = new_jump_tensor * (1.0 - new_end_factor)
-
-                max_values, _ = zoom_indices.max(dim=0, keepdim=True)
-                max_mask = (zoom_indices == max_values)
-                zoom_indices *= max_mask.float()
-                zoom_indices = probability_to_bool(zoom_indices, self.jump_prob).squeeze() # [L, N]
-
-                new_num = torch.sum(zoom_indices) # Y
-
-                for key, tensor in imag_state.items():
-                    new_state[key] = tensor[zoom_indices] # [Y, xx, xx]
-
-                _, new_state_after_jump, _ = self._jumpy(
-                    new_state, self.actor, 1
-                ) 
-
-                _, new_state_after_jump, _ = self._imagine(
-                    new_state_after_jump, self.actor, 1
-                ) 
-
-                new_feat, new_state_sequence, new_action = self._imagine(
-                    new_state_after_jump, self.actor, self._config.imag_horizon
-                ) # [L, N, xx, xx]
-
-                new_jump_record = torch.zeros((self._config.imag_horizon, new_num), device=self._config.device) # [L, Y]
-
-                for key, tensor in imag_state.items():
-                    imag_state[key] = torch.cat((tensor, new_state_sequence[key]), dim=1) # [L, N+Y, xx, xx]
-
-                imag_feat = torch.cat((imag_feat, new_feat), dim=1) # [L, N+Y, xx]
-                imag_action = torch.cat((imag_action, new_action), dim=1) # [L, N+Y, 12]
-                jump_record = torch.cat((jump_record, new_jump_record), dim=1) # [L, N+Y]
-
-                imagination_num_tensor = torch.tensor(state_num, dtype=torch.float32, device=imag_feat.device)
+            # 记录指标
+            metrics.update(tools.tensorstats(value.mode(), "value"))
+            metrics.update(tools.tensorstats(target, "target"))
+            metrics.update(tools.tensorstats(reward, "imag_reward"))
+            
+            with tools.RequiresGrad(self):
+                metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
+                metrics.update(self._value_opt(value_loss, self.value.parameters()))
                 
-                reward = objective(imag_feat, imag_state, imag_action)
-                
-                intrinsic_reward = intrinsic_objective(imag_feat, imag_state, imag_action)
-                reward += intrinsic_reward
+            return imag_feat, imag_state, imag_action, weights, metrics
 
+    def _imagine(self, start, policy, horizon):
+        dynamics = self._world_model.dynamics
+        def step(prev, _):
+            state, _, _ = prev
+            feat = dynamics.get_feat(state)
+            action = policy(feat.detach()).sample()
+            # 扩展动作为 13 维 (包含 0 填充，表示非跳跃动作)
+            new_action = torch.cat((action, torch.zeros(action.shape[0], 1).to(action.device)), dim=-1)
+            succ = dynamics.img_step(state, new_action)
+            return succ, feat, action
 
-                actor_ent = self.actor(imag_feat).entropy() 
-                state_ent = self._world_model.dynamics.get_dist(imag_state).entropy()
+        succ, feats, actions = tools.static_scan(step, [torch.arange(horizon)], (start, None, None))
+        states = {k: torch.cat([start[k][None], v[:-1]], 0) for k, v in succ.items()}
+        if horizon == 1:
+            return feats.squeeze(0), {k: v.squeeze(0) for k, v in succ.items()}, actions.squeeze(0)
+        return feats, states, actions
 
-                jump_sequence_record = torch.any(jump_record, dim=0, keepdim=True).repeat(jump_record.size(0), 1) # [L, N]
-                jump_record_tensor = jump_record.unsqueeze(-1) # [L, N, 1]
-                jump_sequence_record = jump_sequence_record.unsqueeze(-1) # [L, N, 1]
-
-                target, weights, base = self._compute_target(
-                    imag_feat, imag_state, reward, jump_record_tensor, jumping_steps_predictor, accumulated_reward_predictor, is_end
-                )
-
-                actor_loss, mets = self._compute_actor_loss(
-                    imag_feat,
-                    imag_action,
-                    target,
-                    weights,
-                    base,
-                    jump_record_tensor,
-                )
-
-                actor_loss -= self._config.actor["entropy"] * actor_ent[:-1, ..., None]
-                actor_loss = torch.mean(actor_loss)
-                metrics.update(mets)
-                value_input = imag_feat
-
-        with tools.RequiresGrad(self.value):
-            with torch.cuda.amp.autocast(self._use_amp):
-                value = self.value(value_input[:-1].detach())
-                target = torch.stack(target, dim=1)
-
-                value_loss = -value.log_prob(target.detach())
-                slow_target = self._slow_value(value_input[:-1].detach())
-                if self._config.critic["slow_target"]:
-                    value_loss -= value.log_prob(slow_target.mode().detach())
-                value_loss = torch.mean(weights[:-1] * value_loss[:, :, None])
-
-        metrics.update(tools.tensorstats(value.mode(), "value"))
-        metrics.update(tools.tensorstats(target, "target"))
-        metrics.update(tools.tensorstats(reward, "imag_reward"))
-        metrics.update(tools.tensorstats(imagination_num_tensor, "imagination_num"))
-
-        if self._config.actor["dist"] in ["onehot"]:
-            metrics.update(
-                tools.tensorstats(
-                    torch.argmax(imag_action, dim=-1).float(), "imag_action"
-                )
-            )
-        else:
-            metrics.update(tools.tensorstats(imag_action, "imag_action"))
-        metrics["actor_entropy"] = to_np(torch.mean(actor_ent))
-        with tools.RequiresGrad(self):
-            metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
-            metrics.update(self._value_opt(value_loss, self.value.parameters()))
-        return imag_feat, imag_state, imag_action, weights, metrics
-
+    def _jumpy(self, start, policy, horizon):
+        dynamics = self._world_model.dynamics
+        def step(prev, _):
+            state, _, _ = prev
+            feat = dynamics.get_feat(state)
+            action = policy(feat.detach()).sample()
+            # 扩展动作为 13 维 (最后一维设为 1，触发受控分支跳跃)
+            new_action = torch.cat((action, torch.ones(action.shape[0], 1).to(action.device)), dim=-1)
+            succ = dynamics.img_step(state, new_action)
+            return succ, feat, action
+        
+        succ, feats, actions = tools.static_scan(step, [torch.arange(horizon)], (start, None, None))
+        states = {k: torch.cat([start[k][None], v[:-1]], 0) for k, v in succ.items()}
+        if horizon == 1:
+            return feats.squeeze(0), {k: v.squeeze(0) for k, v in succ.items()}, actions.squeeze(0)
+        return feats, states, actions
+    
     def save_state_sequence(self, imag_feat, jump_record, freq=0.1):
         if random.random() > freq:
             return
@@ -850,66 +829,6 @@ class ImagBehavior(nn.Module):
             x_offset += orig_img.width + border_width * 2
 
         composite_image.save(os.path.join(output_dir, f"{current_time}.png"))
-        
-
-    def _imagine(self, start, policy, horizon):
-        dynamics = self._world_model.dynamics
-
-        def step(prev, _):
-            state, _, _ = prev
-            feat = dynamics.get_feat(state)
-            inp = feat.detach()
-            action = policy(inp).sample()
-            
-            # When interacting with the wm, the action needs to be expanded to 13 dimensions.
-            zeros_tensor = torch.zeros(action.shape[0], 1).to(action.device)
-            new_action = torch.cat((action, zeros_tensor), dim=-1)
-            
-            succ = dynamics.img_step(state, new_action)
-            return succ, feat, action
-
-        succ, feats, actions = tools.static_scan(
-            step, [torch.arange(horizon)], (start, None, None)
-        )
-
-        states = {k: torch.cat([start[k][None], v[:-1]], 0) for k, v in succ.items()}
-
-        if horizon == 1:
-            for k, v in succ.items():
-                succ[k] = v.squeeze(0)
-            feats = feats.squeeze(0)
-            actions = actions.squeeze(0)
-            return feats, succ, actions
-        else:
-            return feats, states, actions
-
-    def _jumpy(self, start, policy, horizon):
-        dynamics = self._world_model.dynamics
-
-        def step(prev, _):
-            state, _, _ = prev
-            feat = dynamics.get_feat(state)
-            inp = feat.detach()
-            action = policy(inp).sample()
-
-            new_action = torch.zeros(action.shape[0], action.shape[1] + 1).to(action.device)
-            new_action[:, -1] = 1
-            succ = dynamics.img_step(state, new_action)
-            return succ, feat, action
-        
-        succ, feats, actions = tools.static_scan(
-            step, [torch.arange(horizon)], (start, None, None)
-        )
-        states = {k: torch.cat([start[k][None], v[:-1]], 0) for k, v in succ.items()}
-
-        if horizon == 1:
-            for k, v in succ.items():
-                succ[k] = v.squeeze(0)
-            feats = feats.squeeze(0)
-            actions = actions.squeeze(0)
-            return feats, succ, actions
-        else:
-            return feats, states, actions
 
     def _compute_target(self, imag_feat, imag_state, reward, jump_record, jumping_steps_predictor, accumulated_reward_predictor, is_end):
         fc = torch.cat((imag_feat[:-1], imag_feat[1:]), dim=-1) # [L - 1, N, 2xx]
@@ -946,7 +865,7 @@ class ImagBehavior(nn.Module):
         ).detach()
 
         return target, weights, value[:-1]
-
+    
     def _compute_actor_loss(
         self,
         imag_feat,
@@ -992,7 +911,7 @@ class ImagBehavior(nn.Module):
         actor_loss = -weights[:-1] * jump_mask[:-1] * actor_target
 
         return actor_loss, metrics
-
+    
     def _update_slow_target(self):
         if self._config.critic["slow_target"]:
             if self._updates % self._config.critic["slow_target_update"] == 0:

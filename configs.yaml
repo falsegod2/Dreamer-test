@@ -136,7 +136,7 @@ minedojo:
   steps: 1e6
   parallel: False
   envs: 1
-  eval_episode_num: 3
+  eval_episode_num: 0
   eval_every: 10000
   action_repeat: 1
   train_ratio: 16
