@@ -76,21 +76,40 @@ class RSSM(nn.Module):
         l.apply(tools.uniform_weight_init(1.0)); return l
 
     def initial(self, batch_size):
+        # 1. 初始化确定性状态 (deter)
         deter_s = torch.zeros(batch_size, self._deter_s).to(self._device)
         deter_z = torch.zeros(batch_size, self._deter_z).to(self._device)
+        
         if self._initial == "learned":
             W_s, W_z = torch.split(torch.tanh(self.W), [self._deter_s, self._deter_z], -1)
-            deter_s, deter_z = W_s.repeat(batch_size, 1), W_z.repeat(batch_size, 1)
+            deter_s = W_s.repeat(batch_size, 1)
+            deter_z = W_z.repeat(batch_size, 1)
+
+        # 2. 构造初始状态字典
         state = {"deter_s": deter_s, "deter_z": deter_z}
-        state["stoch_s"] = self._get_stoch_init(deter_s, "s")
-        state["stoch_z"] = self._get_stoch_init(deter_z, "z")
+        
+        # --- 修复点：获取受控分支(s)的初始随机状态及分布参数 ---
+        stoch_s, stats_s = self._get_stoch_and_stats_init(deter_s, "s")
+        state["stoch_s"] = stoch_s
+        state.update({f"s_{k}": v for k, v in stats_s.items()}) # 添加 s_logit 或 s_mean/std
+        
+        # --- 修复点：获取非受控分支(z)的初始随机状态及分布参数 ---
+        stoch_z, stats_z = self._get_stoch_and_stats_init(deter_z, "z")
+        state["stoch_z"] = stoch_z
+        state.update({f"z_{k}": v for k, v in stats_z.items()}) # 添加 z_logit 或 z_mean/std
+        
         return state
 
-    def _get_stoch_init(self, deter, branch):
+    # --- 辅助函数：统一获取初始随机态和参数 ---
+    def _get_stoch_and_stats_init(self, deter, branch):
         net = self._img_out_s if branch == "s" else self._img_out_z
-        stat = self._stat_s_img if branch == "s" else self._stat_z_img
-        stats = self._suff_stats_layer(stat, net(deter), self._stoch_s if branch == "s" else self._stoch_z)
-        return self.get_dist(stats).mode()
+        stat_layer = self._stat_s_img if branch == "s" else self._stat_z_img
+        stoch_dim = self._stoch_s if branch == "s" else self._stoch_z
+        
+        x = net(deter)
+        stats = self._suff_stats_layer(stat_layer, x, stoch_dim)
+        stoch = self.get_dist(stats).mode()
+        return stoch, stats
 
     # --- 必须保留的核心接口：处理正常序列 ---
     def observe(self, embed, action, is_first, state=None):
