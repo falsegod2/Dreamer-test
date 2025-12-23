@@ -639,20 +639,20 @@ class ImagBehavior(nn.Module):
                         for key, tensor in imag_state.items():
                             new_state[key] = tensor[zoom_indices] 
 
-                    _, new_state_after_jump, _ = self._jumpy(new_state, self.actor, 1) 
-                    _, new_state_after_jump, _ = self._imagine(new_state_after_jump, self.actor, 1) 
-                    new_feat, new_state_sequence, new_action = self._imagine(
-                        new_state_after_jump, self.actor, self._config.imag_horizon
-                    ) 
+                        _, new_state_after_jump, _ = self._jumpy(new_state, self.actor, 1) 
+                        _, new_state_after_jump, _ = self._imagine(new_state_after_jump, self.actor, 1) 
+                        new_feat, new_state_sequence, new_action = self._imagine(
+                            new_state_after_jump, self.actor, self._config.imag_horizon
+                        ) 
 
-                    # 合并增强序列
-                    new_jump_record = torch.zeros((self._config.imag_horizon, new_num), device=self._config.device) 
-                    for key, tensor in imag_state.items():
-                        imag_state[key] = torch.cat((tensor, new_state_sequence[key]), dim=1) 
+                        # 合并增强序列
+                        new_jump_record = torch.zeros((self._config.imag_horizon, new_num), device=self._config.device) 
+                        for key, tensor in imag_state.items():
+                            imag_state[key] = torch.cat((tensor, new_state_sequence[key]), dim=1) 
 
-                    imag_feat = torch.cat((imag_feat, new_feat), dim=1) 
-                    imag_action = torch.cat((imag_action, new_action), dim=1) 
-                    jump_record = torch.cat((jump_record, new_jump_record), dim=1) 
+                        imag_feat = torch.cat((imag_feat, new_feat), dim=1) 
+                        imag_action = torch.cat((imag_action, new_action), dim=1) 
+                        jump_record = torch.cat((jump_record, new_jump_record), dim=1) 
 
                     # 5. 奖励计算与策略更新
                     reward = objective(imag_feat, imag_state, imag_action)
