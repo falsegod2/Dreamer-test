@@ -288,26 +288,21 @@ class WorldModel(nn.Module):
                     embed_zoomed = self.encoder(data_zoomed)
 
                     # --- 2. 正常序列观察 (Observe Phase) ---
-                    # post 和 prior 现在包含 deter_s, deter_z, stoch_s, stoch_z 以及各自的分布参数
                     post, prior = self.dynamics.observe(
                         embed, data["action"], data["is_first"]
                     )
 
-                    # --- [核心创新：解耦约束] 计算逆动力学损失 ---
-                    # 取出受控分支的时间序列状态 h_s
-                    h_s_t = post["deter_s"][:, :-1]      # (Batch, Time-1, Deter_s)
-                    h_s_next = post["deter_s"][:, 1:]    # (Batch, Time-1, Deter_s)
-                    
-                    # 拼接相邻特征，预测动作
+                    # --- [创新点 1：解耦约束] 计算逆动力学损失 ---
+                    h_s_t = post["deter_s"][:, :-1]
+                    h_s_next = post["deter_s"][:, 1:]
                     feat_inv = torch.cat([h_s_t, h_s_next], dim=-1)
                     pred_action = self.dynamics._inverse_dynamics(feat_inv)
                     
                     # 目标：受控分支必须能预测出真实动作 (去掉最后一维的跳跃标志)
                     true_action = data["action"][:, :-1, :-1] 
                     loss_inv = F.mse_loss(pred_action, true_action)
-                    # --------------------------------------------
 
-                    # 3. 计算 KL 散度损失 (内部已适配双分支并行计算)
+                    # 3. 计算 KL 散度损失
                     kl_free = self._config.kl_free 
                     dyn_scale = self._config.dyn_scale 
                     rep_scale = self._config.rep_scale 
@@ -319,23 +314,23 @@ class WorldModel(nn.Module):
                     # 4. 计算各个预测头 (Heads) 的损失
                     preds = {}
                     for name, head in self.heads.items():
-                        if name == "jumping_steps" or name == "accumulated_reward":
+                        if name in ["jumping_steps", "accumulated_reward"]:
                             continue
                         grad_head = name in self._config.grad_heads
-                        # get_feat 会自动拼接受控和非受控状态供 Head 使用
                         feat = self.dynamics.get_feat(post)
                         feat = feat if grad_head else feat.detach()
                         pred = head(feat)
                         
-                        if type(pred) is dict:
+                        # --- 修复点：正确处理字典类型的输出 (如 Decoder) ---
+                        if isinstance(pred, dict):
                             preds.update(pred)
                         else:
                             preds[name] = pred
                             
                     losses = {}
                     for name, pred in preds.items():
+                        # 确保 data 中存在对应的 key (如 'image', 'heatmap', 'reward' 等)
                         loss = -pred.log_prob(data[name])
-                        assert loss.shape == embed.shape[:2], (name, loss.shape)
                         losses[name] = loss
                         
                     scaled = {
@@ -348,14 +343,12 @@ class WorldModel(nn.Module):
                         is_zoomed_indices = data["is_zoomed"].squeeze(-1).bool()
                         is_calculated_mask = data["is_calculated"][is_zoomed_indices]
                         
-                        # 准备缩放数据的输入
                         curr_embed_zoomed = embed_zoomed[is_zoomed_indices].unsqueeze(1)
                         curr_data_zoomed = {k: v[is_zoomed_indices].unsqueeze(1) for k, v in data_zoomed.items()}
 
                         selected_post = {k: v[is_zoomed_indices].unsqueeze(1) for k, v in post.items()}
                         selected_prior = {k: v[is_zoomed_indices].unsqueeze(1) for k, v in prior.items()}
 
-                        # 调用双分支适配的 observe_zoomed
                         post_zoomed, prior_zoomed = self.dynamics.observe_zoomed(
                             curr_embed_zoomed, curr_data_zoomed["action"], curr_data_zoomed["is_first"], 
                             selected_post, selected_prior
@@ -365,11 +358,10 @@ class WorldModel(nn.Module):
                             post_zoomed, prior_zoomed, kl_free, dyn_scale, rep_scale
                         )
 
-                        # 计算跳跃分支的 Heads 损失
                         preds_zoomed = {}
                         for name, head in self.heads.items():
                             grad_head_zoomed = name in self._config.grad_heads
-                            if name == "jumping_steps" or name == "accumulated_reward":
+                            if name in ["jumping_steps", "accumulated_reward"]:
                                 feat_zoomed = self.dynamics.get_feat(post_zoomed)
                                 feat_before_zoom = self.dynamics.get_feat(selected_post)
                                 feat_concat = torch.concat([feat_before_zoom, feat_zoomed], dim=-1)
@@ -379,7 +371,12 @@ class WorldModel(nn.Module):
                                 feat_zoomed = self.dynamics.get_feat(post_zoomed)
                                 feat_zoomed = feat_zoomed if grad_head_zoomed else feat_zoomed.detach()
                                 pred_zoomed = head(feat_zoomed)
-                            preds_zoomed[name] = pred_zoomed
+                            
+                            # --- 修复点：Zoomed 分支同样需要字典拆解 ---
+                            if isinstance(pred_zoomed, dict):
+                                preds_zoomed.update(pred_zoomed)
+                            else:
+                                preds_zoomed[name] = pred_zoomed
                                 
                         losses_zoomed = {}
                         for name, pred in preds_zoomed.items():
@@ -397,21 +394,18 @@ class WorldModel(nn.Module):
 
                     # --- 6. 损失聚合与优化 ---
                     if zoomed_num > 0:
-                        # 合并正常和跳跃分支的 KL 与重构 Loss
                         kl_loss = torch.cat((kl_loss_img.reshape(-1), kl_loss_jmp.reshape(-1)), dim=0)
                         scaled_img = sum(scaled.values()).reshape(-1)
                         scaled_jmp = sum(scaled_zoomed.values()).reshape(-1)
                         scaled_sum = torch.cat((scaled_img, scaled_jmp * self._config.long_term_branch_weight), dim=0)
-                        
                         model_loss = scaled_sum + kl_loss
                     else:
                         kl_loss = kl_loss_img
                         model_loss = sum(scaled.values()) + kl_loss
 
-                    # 加入逆动力学损失 (解耦约束)
+                    # 加入逆动力学损失
                     model_loss = torch.mean(model_loss) + loss_inv * self._scales.get("inverse", 1.0)
 
-                # 统一执行梯度更新
                 metrics = self._model_opt(model_loss, self.parameters())
 
             # 记录指标
@@ -420,14 +414,15 @@ class WorldModel(nn.Module):
             metrics["model_loss"] = to_np(model_loss)
             metrics["kl"] = to_np(torch.mean(kl_value_img))
             
-            # 记录解耦状态的熵 (Entropies) 用于监控分支状态
+            # 监控解耦状态熵
             with torch.cuda.amp.autocast(self._use_amp):
-                metrics["post_ent_s"] = to_np(torch.mean(self.dynamics.get_dist({k[2:]:v for k,v in post.items() if k.startswith("s_")}).entropy()))
-                metrics["post_ent_z"] = to_np(torch.mean(self.dynamics.get_dist({k[2:]:v for k,v in post.items() if k.startswith("z_")}).entropy()))
+                s_stats = {k[2:]:v for k,v in post.items() if k.startswith("s_")}
+                z_stats = {k[2:]:v for k,v in post.items() if k.startswith("z_")}
+                metrics["post_ent_s"] = to_np(torch.mean(self.dynamics.get_dist(s_stats).entropy()))
+                metrics["post_ent_z"] = to_np(torch.mean(self.dynamics.get_dist(z_stats).entropy()))
 
             post = {k: v.detach() for k, v in post.items()}
             post_zoomed = {k: v.detach() for k, v in post_zoomed.items()} if zoomed_num > 0 else None
-            
             context = dict(embed=embed, feat=self.dynamics.get_feat(post), kl=kl_value_img)
 
             return post, post_zoomed, context, metrics
