@@ -153,6 +153,11 @@ class RSSM(nn.Module):
                 is_f_r = torch.reshape(is_first, is_first.shape + (1,) * (len(v.shape) - len(is_first.shape)))
                 prev_state[k] = v * (1.0 - is_f_r) + init_s[k] * is_f_r
 
+        # --- 核心修复：自动补全动作维度 ---
+        # 如果传入的是原始动作(12维)，自动补一个0(非跳跃标志)，变成13维
+        if prev_action is not None and prev_action.shape[-1] == self._num_actions - 1:
+            prev_action = torch.cat([prev_action, torch.zeros_like(prev_action[..., :1])], -1)
+
         prior = self.img_step(prev_state, prev_action)
         # 受控后验
         stats_s = self._suff_stats_layer(self._stat_s_obs, self._obs_out_s(torch.cat([prior["deter_s"], embed], -1)), self._stoch_s)

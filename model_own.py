@@ -572,7 +572,7 @@ class ImagBehavior(nn.Module):
                         for k, v in start.items():
                             start[k] = torch.cat((v, start_zoomed[k]), dim=0)
 
-                    # --- 修复点：使用 deter_s 获取并行序列数量 ---
+                    # 使用 deter_s 获取并行序列数量 (适配解耦架构)
                     state_num = start['deter_s'].shape[0] 
 
                     imag_state = {} 
@@ -588,20 +588,25 @@ class ImagBehavior(nn.Module):
 
                     # 2. 想象循环 (Imagination Horizon)
                     for _ in range (self._config.imag_horizon - 1):
-                        # 获取当前步骤状态
+                        # 获取当前末端状态
                         checking_state = {key: tensor[-1] for key, tensor in imag_state.items()}
-                        jump_tensor = jump_indicator(checking_state)
-                        end_factor = is_end(checking_state)
-                        indices = probability_to_bool(jump_tensor * (1.0 - end_factor), self.jump_prob).squeeze()
-                        jump_record = torch.cat((jump_record, indices.unsqueeze(0)), dim=0)
+                        
+                        # 判定是否执行跳跃
+                        jump_tensor = jump_indicator(checking_state) 
+                        end_factor = is_end(checking_state) 
+                        
+                        # 生成跳跃掩码
+                        indices = probability_to_bool(jump_tensor * (1.0 - end_factor), self.jump_prob).squeeze() 
+                        jump_record = torch.cat((jump_record, indices.unsqueeze(0)), dim=0) 
 
                         # --- 常规短时想象 (所有样本) ---
                         _, state_after_imagination, ac = self._imagine(checking_state, self.actor, 1)
                         imag_action = torch.cat((imag_action, ac.unsqueeze(0)), dim=0)
 
-                        # --- 跳转逻辑 (仅在有样本满足条件时执行) ---
+                        # --- 跳转逻辑：增加 indices.any() 保护 ---
                         if indices.any():
                             jump_state = {key: tensor[indices] for key, tensor in checking_state.items()}
+                            # 执行受控跳转 (Innovation 1: 异步跳跃)
                             _, state_after_jumping, _ = self._jumpy(jump_state, self.actor, 1)
                             _, state_after_jumping, _ = self._imagine(state_after_jumping, self.actor, 1)
                             
@@ -621,10 +626,8 @@ class ImagBehavior(nn.Module):
                     imag_feat = self._world_model.dynamics.get_feat(imag_state) 
                     inp = imag_feat[-1].detach()
                     last_imag_action = self.actor(inp).sample() 
-                    imag_action = torch.cat((imag_action, last_imag_action.unsqueeze(0)), dim=0) 
-
+                    
                     # 4. 数据增强 (Data Augmentation) 逻辑
-                    new_state = {}
                     new_jump_tensor = jump_indicator(imag_state) 
                     new_end_factor = is_end(imag_state) 
                     zoom_indices = new_jump_tensor * (1.0 - new_end_factor)
@@ -635,12 +638,16 @@ class ImagBehavior(nn.Module):
                     zoom_indices = probability_to_bool(zoom_indices, self.jump_prob).squeeze() 
 
                     new_num = torch.sum(zoom_indices) 
-                    if new_num > 0: # 增加此判断
+
+                    # --- 关键修复：整个计算链必须全部缩进在 if new_num > 0 里面 ---
+                    if new_num > 0:
+                        new_state = {}
                         for key, tensor in imag_state.items():
                             new_state[key] = tensor[zoom_indices] 
 
                         _, new_state_after_jump, _ = self._jumpy(new_state, self.actor, 1) 
                         _, new_state_after_jump, _ = self._imagine(new_state_after_jump, self.actor, 1) 
+                        
                         new_feat, new_state_sequence, new_action = self._imagine(
                             new_state_after_jump, self.actor, self._config.imag_horizon
                         ) 
@@ -651,8 +658,14 @@ class ImagBehavior(nn.Module):
                             imag_state[key] = torch.cat((tensor, new_state_sequence[key]), dim=1) 
 
                         imag_feat = torch.cat((imag_feat, new_feat), dim=1) 
+                        # 修正动作拼接逻辑，确保维度对齐
+                        imag_action = torch.cat((imag_action, last_imag_action.unsqueeze(0)), dim=0)
                         imag_action = torch.cat((imag_action, new_action), dim=1) 
                         jump_record = torch.cat((jump_record, new_jump_record), dim=1) 
+                    else:
+                        # 如果没有增强样本，仅补全当前步动作
+                        imag_action = torch.cat((imag_action, last_imag_action.unsqueeze(0)), dim=0)
+                    # --- 缩进结束 ---
 
                     # 5. 奖励计算与策略更新
                     reward = objective(imag_feat, imag_state, imag_action)
@@ -661,13 +674,11 @@ class ImagBehavior(nn.Module):
 
                     actor_ent = self.actor(imag_feat).entropy() 
 
-                    # 计算目标价值 (Lambda-return)
                     target, weights, base = self._compute_target(
                         imag_feat, imag_state, reward, jump_record.unsqueeze(-1), 
                         jumping_steps_predictor, accumulated_reward_predictor, is_end
                     )
 
-                    # 计算 Actor 损失
                     actor_loss, mets = self._compute_actor_loss(
                         imag_feat, imag_action, target, weights, base, jump_record.unsqueeze(-1)
                     )
@@ -688,7 +699,6 @@ class ImagBehavior(nn.Module):
                         value_loss -= value.log_prob(slow_target.mode().detach())
                     value_loss = torch.mean(weights[:-1] * value_loss[:, :, None])
 
-            # 记录指标
             metrics.update(tools.tensorstats(value.mode(), "value"))
             metrics.update(tools.tensorstats(target, "target"))
             metrics.update(tools.tensorstats(reward, "imag_reward"))
