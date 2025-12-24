@@ -8,7 +8,11 @@ defaults:
   enable_cloud_backup: False   # 是否开启云盘备份 (默认为 False，本地跑的时候就不报错了)
   cloud_backup_interval: 7200  # 备份间隔时间，单位为秒 (7200秒 = 2小时)
 
-  inverse_loss_scale: 1.0
+  # configs.yaml -> minedojo 部分
+  # ... 原有参数 ...
+  inverse_loss_scale: 1.0      # 创新 1：逆动力学约束
+  affordance_s_scale: 2.0      # 创新 2：可供性地图对齐约束 (建议设为 2.0 增强引导)
+
   logdir: null
   traindir: null
   evaldir: null

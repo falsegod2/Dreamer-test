@@ -272,6 +272,8 @@ class WorldModel(nn.Module):
             jumping_steps=config.jumping_steps_head["loss_scale"],
             accumulated_reward=config.accumulated_reward_head["loss_scale"],
             inverse=getattr(config, "inverse_loss_scale", 1.0), # 建议在 configs.yaml 默认设为 1.0
+            # 增加创新点 2 的损失权重，建议初始设为 1.0 或 2.0
+            affordance_s=getattr(config, "affordance_s_scale", 1.0),
         )
 
     def _train(self, data_origin):
@@ -283,11 +285,12 @@ class WorldModel(nn.Module):
 
             with tools.RequiresGrad(self):
                 with torch.cuda.amp.autocast(self._use_amp):
-                    # 编码图像
+                    # 编码图像特征
                     embed = self.encoder(data)
                     embed_zoomed = self.encoder(data_zoomed)
 
                     # --- 2. 正常序列观察 (Observe Phase) ---
+                    # post 包含: deter_s, deter_z, stoch_s, stoch_z
                     post, prior = self.dynamics.observe(
                         embed, data["action"], data["is_first"]
                     )
@@ -298,9 +301,26 @@ class WorldModel(nn.Module):
                     feat_inv = torch.cat([h_s_t, h_s_next], dim=-1)
                     pred_action = self.dynamics._inverse_dynamics(feat_inv)
                     
-                    # 目标：受控分支必须能预测出真实动作 (去掉最后一维的跳跃标志)
+                    # 目标：受控分支必须预测出真实动作 (去掉 13 维中的跳跃标志)
                     true_action = data["action"][:, :-1, :-1] 
                     loss_inv = F.mse_loss(pred_action, true_action)
+
+                    # --- [创新点 2：可供性先验指导的解耦增强] ---
+                    # A. 确定受控分支特征的维度范围 (s_stoch + deter_s)
+                    s_stoch_dim = self.dynamics._stoch_s * (self.dynamics._discrete if self.dynamics._discrete else 1)
+                    s_feat_dim = s_stoch_dim + self.dynamics._deter_s
+                    
+                    # B. 从拼接后的特征中提取受控分支部分
+                    feat_all = self.dynamics.get_feat(post)
+                    # 构造一个遮罩特征：仅保留前 s_feat_dim 位（受控信息），其余位置零
+                    feat_s_only = torch.zeros_like(feat_all)
+                    feat_s_only[..., :s_feat_dim] = feat_all[..., :s_feat_dim]
+                    
+                    # C. 核心创新：强制仅利用受控分支特征重构 Heatmap
+                    # 这会迫使模型将任务目标的相关视觉信息压入 s 分支
+                    preds_s = self.heads["decoder"](feat_s_only)
+                    loss_affordance_s = -preds_s['heatmap'].log_prob(data['heatmap'])
+                    # --------------------------------------------
 
                     # 3. 计算 KL 散度损失
                     kl_free = self._config.kl_free 
@@ -321,7 +341,6 @@ class WorldModel(nn.Module):
                         feat = feat if grad_head else feat.detach()
                         pred = head(feat)
                         
-                        # --- 修复点：正确处理字典类型的输出 (如 Decoder) ---
                         if isinstance(pred, dict):
                             preds.update(pred)
                         else:
@@ -329,7 +348,6 @@ class WorldModel(nn.Module):
                             
                     losses = {}
                     for name, pred in preds.items():
-                        # 确保 data 中存在对应的 key (如 'image', 'heatmap', 'reward' 等)
                         loss = -pred.log_prob(data[name])
                         losses[name] = loss
                         
@@ -372,7 +390,6 @@ class WorldModel(nn.Module):
                                 feat_zoomed = feat_zoomed if grad_head_zoomed else feat_zoomed.detach()
                                 pred_zoomed = head(feat_zoomed)
                             
-                            # --- 修复点：Zoomed 分支同样需要字典拆解 ---
                             if isinstance(pred_zoomed, dict):
                                 preds_zoomed.update(pred_zoomed)
                             else:
@@ -403,18 +420,21 @@ class WorldModel(nn.Module):
                         kl_loss = kl_loss_img
                         model_loss = sum(scaled.values()) + kl_loss
 
-                    # 加入逆动力学损失
-                    model_loss = torch.mean(model_loss) + loss_inv * self._scales.get("inverse", 1.0)
+                    # 汇总三大核心创新损失：基础重构 + 逆动力学 + 热力图先验
+                    total_loss = torch.mean(model_loss) + \
+                                loss_inv * self._scales.get("inverse", 1.0) + \
+                                torch.mean(loss_affordance_s) * self._scales.get("affordance_s", 1.0)
 
-                metrics = self._model_opt(model_loss, self.parameters())
+                # 统一执行优化
+                metrics = self._model_opt(total_loss, self.parameters())
 
             # 记录指标
             metrics.update({f"{name}_loss": to_np(torch.mean(loss)) for name, loss in losses.items()})
             metrics["loss_inverse"] = to_np(loss_inv)
-            metrics["model_loss"] = to_np(model_loss)
+            metrics["loss_affordance_s"] = to_np(torch.mean(loss_affordance_s))
+            metrics["model_loss"] = to_np(total_loss)
             metrics["kl"] = to_np(torch.mean(kl_value_img))
             
-            # 监控解耦状态熵
             with torch.cuda.amp.autocast(self._use_amp):
                 s_stats = {k[2:]:v for k,v in post.items() if k.startswith("s_")}
                 z_stats = {k[2:]:v for k,v in post.items() if k.startswith("z_")}

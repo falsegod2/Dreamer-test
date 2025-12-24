@@ -217,24 +217,21 @@ class RSSM(nn.Module):
         return tools.ContDist(torchd.independent.Independent(torchd.normal.Normal(stats["mean"], stats["std"]), 1))
 
     def get_feat(self, state):
-        # 确保 state 是字典且包含必要的键，增加容错性
         s_stoch = state.get("stoch_s", torch.tensor([]).to(self._device))
         z_stoch = state.get("stoch_z", torch.tensor([]).to(self._device))
         deter_s = state.get("deter_s", torch.tensor([]).to(self._device))
         deter_z = state.get("deter_z", torch.tensor([]).to(self._device))
 
         if self._discrete:
-            # 修复点：显式计算维度 [stoch_dim * discrete_num]，不再使用 -1
             s_dim = self._stoch_s * self._discrete
             z_dim = self._stoch_z * self._discrete
-            
-            # 只有在非空时才进行 reshape
             if s_stoch.numel() > 0:
                 s_stoch = s_stoch.reshape(list(s_stoch.shape[:-2]) + [s_dim])
             if z_stoch.numel() > 0:
                 z_stoch = z_stoch.reshape(list(z_stoch.shape[:-2]) + [z_dim])
         
-        # 即使是空 Tensor，只要最后一维对齐，cat 就能成功
+        # 确认顺序：s_stoch -> deter_s -> z_stoch -> deter_z
+        # 这保证了前 (s_stoch + deter_s) 位全是受控信息
         return torch.cat([s_stoch, deter_s, z_stoch, deter_z], -1)
 
     def kl_loss(self, post, prior, free, dyn_scale, rep_scale):
