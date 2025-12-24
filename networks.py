@@ -65,19 +65,24 @@ class RSSM(nn.Module):
         if self._initial == "learned":
             self.W = torch.nn.Parameter(torch.zeros((1, self._deter), device=torch.device(self._device)), requires_grad=True)
         
-        # 交互探测器：输入受控分支特征，输出一个交互置信度 (0~1)
+        # [创新点 3] 交互探测器：输入受控分支特征 (s)，输出交互强度 (0~1)
+        # 输入维度: deter_s + stoch_s (discrete 模式下需展平)
+        stoch_size_s = self._stoch_s * (self._discrete if self._discrete else 1)
         self._interaction_gate = nn.Sequential(
             nn.Linear(self._deter_s + stoch_size_s, self._hidden),
-            nn.ReLU(),
+            nn.LayerNorm(self._hidden, eps=1e-03) if norm else nn.Identity(),
+            act_fn(),
             nn.Linear(self._hidden, 1),
             nn.Sigmoid()
         )
+        self._interaction_gate.apply(tools.weight_init)
 
+    # [创新点 3] 获取交互分数函数
     def get_interaction_score(self, state):
-        # 仅利用受控分支特征 (s)
         s_stoch = state["stoch_s"]
         if self._discrete:
             s_stoch = s_stoch.reshape(list(s_stoch.shape[:-2]) + [self._stoch_s * self._discrete])
+        # 仅拼接受控分支的随机态和确定态
         feat_s = torch.cat([s_stoch, state["deter_s"]], -1)
         return self._interaction_gate(feat_s)
     

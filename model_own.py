@@ -274,6 +274,7 @@ class WorldModel(nn.Module):
             inverse=getattr(config, "inverse_loss_scale", 1.0), # 建议在 configs.yaml 默认设为 1.0
             # 增加创新点 2 的损失权重，建议初始设为 1.0 或 2.0
             affordance_s=getattr(config, "affordance_s_scale", 1.0),
+            interaction=getattr(config, "interaction_loss_scale", 1.0),
         )
 
     def _train(self, data_origin):
@@ -322,14 +323,21 @@ class WorldModel(nn.Module):
                     loss_affordance_s = -preds_s['heatmap'].log_prob(data['heatmap'])
                     # --------------------------------------------
 
-                    # --- [创新点 3：交互门训练] ---
-                    # 目标：交互门应该在奖励 (Reward) 发生剧烈变化的地方输出高值
+                    # --- [创新点 3：交互门训练逻辑修复] ---
+                    # 1. 计算当前受控状态下的交互分数 (B, T, 1)
                     interaction_score = self.dynamics.get_interaction_score(post)
-                    # 计算奖励的变化梯度作为监督信号
+                    
+                    # 2. 计算奖励的变化梯度作为真实标签 (B, T)
+                    # 计算相邻步奖励差的绝对值
                     reward_diff = torch.abs(data["reward"][:, 1:] - data["reward"][:, :-1])
+                    # 在起始端补零，对齐时间步长度 T
                     reward_diff = torch.cat([torch.zeros_like(reward_diff[:, :1]), reward_diff], dim=1)
-                    # 交互门损失：让 interaction_score 拟合奖励的突变
-                    loss_interaction = F.binary_cross_entropy(interaction_score, (reward_diff > 0).float())
+                    
+                    # --- 修复点：使用 unsqueeze(-1) 将 (B, T) 变为 (B, T, 1) ---
+                    interaction_target = (reward_diff > 0).float().unsqueeze(-1)
+                    
+                    # 计算二元交叉熵损失
+                    loss_interaction = F.binary_cross_entropy(interaction_score, interaction_target)
                     # --------------------------------------------
 
                     # 3. 计算 KL 散度损失
@@ -430,12 +438,11 @@ class WorldModel(nn.Module):
                         kl_loss = kl_loss_img
                         model_loss = sum(scaled.values()) + kl_loss
 
-                    # 汇总三大核心创新损失：基础重构 + 逆动力学 + 热力图先验
+                    # 3. 汇总总损失
                     total_loss = torch.mean(model_loss) + \
                                 loss_inv * self._scales.get("inverse", 1.0) + \
-                                torch.mean(loss_affordance_s) * self._scales.get("affordance_s", 1.0)
-                    
-                    total_loss += torch.mean(loss_interaction) * self._scales.get("interaction", 1.0)
+                                torch.mean(loss_affordance_s) * self._scales.get("affordance_s", 1.0) + \
+                                torch.mean(loss_interaction) * self._scales.get("interaction", 1.0)
 
                 # 统一执行优化
                 metrics = self._model_opt(total_loss, self.parameters())
@@ -446,6 +453,7 @@ class WorldModel(nn.Module):
             metrics["loss_affordance_s"] = to_np(torch.mean(loss_affordance_s))
             metrics["model_loss"] = to_np(total_loss)
             metrics["kl"] = to_np(torch.mean(kl_value_img))
+            metrics["loss_interaction"] = to_np(torch.mean(loss_interaction))
             
             with torch.cuda.amp.autocast(self._use_amp):
                 s_stats = {k[2:]:v for k,v in post.items() if k.startswith("s_")}
