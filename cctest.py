@@ -6,9 +6,9 @@ import os
 
 # --- 配置部分 ---
 # 这里填写你的日志文件名
-FILE_PATH = './load_metric/no-drive.jsonl' 
+FILE_PATH = './load_metric/M.jsonl' 
 # 如果你有另一个对比文件（比如提供的 iso_12_8），可以填在这里，否则设为 None
-FILE_PATH_2 = './load_metric/CORE-2.jsonl' 
+FILE_PATH_2 = './load_metric/CORE.jsonl' 
 
 # 平滑系数 (0~1)，越大越平滑，论文图中通常设为 0.6 到 0.99
 SMOOTH_FACTOR = 0.997  

@@ -322,6 +322,16 @@ class WorldModel(nn.Module):
                     loss_affordance_s = -preds_s['heatmap'].log_prob(data['heatmap'])
                     # --------------------------------------------
 
+                    # --- [创新点 3：交互门训练] ---
+                    # 目标：交互门应该在奖励 (Reward) 发生剧烈变化的地方输出高值
+                    interaction_score = self.dynamics.get_interaction_score(post)
+                    # 计算奖励的变化梯度作为监督信号
+                    reward_diff = torch.abs(data["reward"][:, 1:] - data["reward"][:, :-1])
+                    reward_diff = torch.cat([torch.zeros_like(reward_diff[:, :1]), reward_diff], dim=1)
+                    # 交互门损失：让 interaction_score 拟合奖励的突变
+                    loss_interaction = F.binary_cross_entropy(interaction_score, (reward_diff > 0).float())
+                    # --------------------------------------------
+
                     # 3. 计算 KL 散度损失
                     kl_free = self._config.kl_free 
                     dyn_scale = self._config.dyn_scale 
@@ -424,6 +434,8 @@ class WorldModel(nn.Module):
                     total_loss = torch.mean(model_loss) + \
                                 loss_inv * self._scales.get("inverse", 1.0) + \
                                 torch.mean(loss_affordance_s) * self._scales.get("affordance_s", 1.0)
+                    
+                    total_loss += torch.mean(loss_interaction) * self._scales.get("interaction", 1.0)
 
                 # 统一执行优化
                 metrics = self._model_opt(total_loss, self.parameters())
@@ -611,12 +623,20 @@ class ImagBehavior(nn.Module):
                         # 获取当前末端状态
                         checking_state = {key: tensor[-1] for key, tensor in imag_state.items()}
                         
-                        # 判定是否执行跳跃
-                        jump_tensor = jump_indicator(checking_state) 
-                        end_factor = is_end(checking_state) 
+                        # --- [创新点 3：交互驱动判定] ---
+                        # 获取传统的跳跃预测
+                        jump_prob_pred = jump_indicator(checking_state) 
+                        # 获取受控分支的交互强度 (Interaction Score)
+                        interaction_score = self._world_model.dynamics.get_interaction_score(checking_state)
                         
-                        # 生成跳跃掩码
-                        indices = probability_to_bool(jump_tensor * (1.0 - end_factor), self.jump_prob).squeeze() 
+                        # 融合逻辑：只有当预测要跳跃，且交互强度高于阈值时，才执行精准跳跃
+                        # 这能过滤掉由于环境背景波动引起的“伪跳跃”
+                        refined_jump_prob = jump_prob_pred * interaction_score 
+                        
+                        end_factor = is_end(checking_state) 
+                        indices = probability_to_bool(refined_jump_prob * (1.0 - end_factor), self.jump_prob).squeeze()
+
+
                         jump_record = torch.cat((jump_record, indices.unsqueeze(0)), dim=0) 
 
                         # --- 常规短时想象 (所有样本) ---

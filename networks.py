@@ -64,7 +64,23 @@ class RSSM(nn.Module):
 
         if self._initial == "learned":
             self.W = torch.nn.Parameter(torch.zeros((1, self._deter), device=torch.device(self._device)), requires_grad=True)
+        
+        # 交互探测器：输入受控分支特征，输出一个交互置信度 (0~1)
+        self._interaction_gate = nn.Sequential(
+            nn.Linear(self._deter_s + stoch_size_s, self._hidden),
+            nn.ReLU(),
+            nn.Linear(self._hidden, 1),
+            nn.Sigmoid()
+        )
 
+    def get_interaction_score(self, state):
+        # 仅利用受控分支特征 (s)
+        s_stoch = state["stoch_s"]
+        if self._discrete:
+            s_stoch = s_stoch.reshape(list(s_stoch.shape[:-2]) + [self._stoch_s * self._discrete])
+        feat_s = torch.cat([s_stoch, state["deter_s"]], -1)
+        return self._interaction_gate(feat_s)
+    
     def _make_layer(self, inp_dim, norm, act_fn):
         layers = [nn.Linear(inp_dim, self._hidden, bias=False)]
         if norm: layers.append(nn.LayerNorm(self._hidden, eps=1e-03))

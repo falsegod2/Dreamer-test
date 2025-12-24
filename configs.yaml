@@ -12,6 +12,8 @@ defaults:
   # ... 原有参数 ...
   inverse_loss_scale: 1.0      # 创新 1：逆动力学约束
   affordance_s_scale: 2.0      # 创新 2：可供性地图对齐约束 (建议设为 2.0 增强引导)
+  interaction_loss_scale: 1.0  # 创新点 3 权重
+  jump_prob: 0.5               # 稍微调低原始跳跃概率，让交互门起决定性作用
 
   logdir: null
   traindir: null
@@ -101,7 +103,7 @@ defaults:
   # Behavior.
   discount: 0.997
   discount_lambda: 0.95
-  jump_prob: 0.7
+  #jump_prob: 0.7
   jump_prob_decay: 0.9997
   imag_horizon: 15
   max_imag_sequences_num: 1024
