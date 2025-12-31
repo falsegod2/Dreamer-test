@@ -488,12 +488,15 @@ class ConcentrationWrapper(Wrapper):
         obs = self.env.reset(**kwargs)
 
         score, zoom_in_prob, check_threshold = self.concentration.get_reward(obs, self.prompt, self.episode, self.steps)
-        zoomed_image, is_check = self.concentration.generate_zoom_in_frame()
+        #zoomed_image, is_check = self.concentration.generate_zoom_in_frame()
+        '''
         if is_check:
             mineclip_on_zoomed, gaussian_on_zoomed, zoom_in_prob_on_zoomed, is_zoomed, jump = self.concentration.compute_reward_on_zoomed_image()
         else:
             mineclip_on_zoomed, gaussian_on_zoomed, zoom_in_prob_on_zoomed, is_zoomed, jump = 0.0, 0.0, 0.0, False, False
+        '''
 
+        """
         obs['is_zoomed'] = is_zoomed
         obs['jump'] = jump
         obs['jumping_steps'] = self.max_steps
@@ -503,6 +506,7 @@ class ConcentrationWrapper(Wrapper):
         obs['intrinsic_on_zoomed'] = 0.0
         obs['score_on_zoomed'] = 0.0
         obs['zoomed_image'] = zoomed_image
+        """
 
         if score > self.last_score:
             obs['intrinsic'] += self.dense_reward * score * self.gaussian_reward_weight
@@ -510,6 +514,7 @@ class ConcentrationWrapper(Wrapper):
 
         obs['score'] += self.dense_reward * score
 
+        '''
         if is_zoomed:
             if gaussian_on_zoomed > self.last_score and gaussian_on_zoomed > self.last_zoom_in_gaussian_score:
                 obs['intrinsic_on_zoomed'] += self.dense_reward * gaussian_on_zoomed * self.gaussian_reward_weight
@@ -522,13 +527,15 @@ class ConcentrationWrapper(Wrapper):
                 self.last_zoom_in_mineclip_score = mineclip_on_zoomed
 
             obs['score_on_zoomed'] += self.mineclip_dense_reward * mineclip_on_zoomed
-           
+        '''
+
         obs['heatmap'] = self.concentration.get_heatmap(is_zoomed=False)
+        '''
         if is_zoomed:
             obs['heatmap_on_zoomed'] = self.concentration.get_heatmap(is_zoomed=True)
         else:
             obs['heatmap_on_zoomed'] = obs['heatmap']
-        
+        '''
         return obs
     
     def step(self, action):
@@ -537,12 +544,14 @@ class ConcentrationWrapper(Wrapper):
 
         if len(self.prompt) > 0:
             score, zoom_in_prob, check_threshold = self.concentration.get_reward(obs, self.prompt, self.episode, self.steps)
+            '''
             zoomed_image, is_check = self.concentration.generate_zoom_in_frame()
             if is_check:
                 mineclip_on_zoomed, gaussian_on_zoomed, zoom_in_prob_on_zoomed, is_zoomed, jump = self.concentration.compute_reward_on_zoomed_image()
             else:
                 mineclip_on_zoomed, gaussian_on_zoomed, zoom_in_prob_on_zoomed, is_zoomed, jump = 0.0, 0.0, 0.0, False, False
-            
+            '''
+            '''
             obs['is_zoomed'] = is_zoomed
             obs['jump'] = jump
             obs['jumping_steps'] = self.max_steps
@@ -552,13 +561,13 @@ class ConcentrationWrapper(Wrapper):
             obs['intrinsic_on_zoomed'] = 0.0
             obs['score_on_zoomed'] = 0.0
             obs['zoomed_image'] = zoomed_image
-
+            '''
             if score > self.last_score:
                 obs['intrinsic'] += self.dense_reward * score * self.gaussian_reward_weight
                 self.last_score = score
 
             obs['score'] += self.dense_reward * score
-
+            '''
             if is_zoomed:
                 if gaussian_on_zoomed > self.last_score and gaussian_on_zoomed > self.last_zoom_in_gaussian_score:
                     obs['intrinsic_on_zoomed'] += self.dense_reward * gaussian_on_zoomed * self.gaussian_reward_weight
@@ -572,13 +581,14 @@ class ConcentrationWrapper(Wrapper):
                     self.last_zoom_in_mineclip_score = mineclip_on_zoomed
 
                 obs['score_on_zoomed'] += self.mineclip_dense_reward * mineclip_on_zoomed
-
+            '''
             obs['heatmap'] = self.concentration.get_heatmap(is_zoomed=False)
+            '''
             if is_zoomed:
                 obs['heatmap_on_zoomed'] = self.concentration.get_heatmap(is_zoomed=True)
             else:
                 obs['heatmap_on_zoomed'] = obs['heatmap']
-                
+            '''
         return obs, reward, done, info
     
 
@@ -639,19 +649,19 @@ class MinedojoLSImagineWrapper(Wrapper):
             {
                 'image': spaces.Box(low=0, high=255, shape=(64, 64, 3), dtype=np.uint8),
                 'heatmap': spaces.Box(low=0, high=255, shape=(64, 64, 1), dtype=np.uint8),
-                'jump': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
-                'is_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
-                'is_calculated': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
+                #'jump': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
+                #'is_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
+                #'is_calculated': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
                 'is_first': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
                 'is_last': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
                 'is_terminal': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
-                'reward_on_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                #'reward_on_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
                 'intrinsic': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
-                'intrinsic_on_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                #'intrinsic_on_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
                 'score': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
-                'score_on_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
-                'jumping_steps': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
-                'accumulated_reward': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                #'score_on_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                #'jumping_steps': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                #'accumulated_reward': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
             }
         )
 
@@ -702,43 +712,44 @@ class MinedojoLSImagineWrapper(Wrapper):
         image = image.transpose(1, 2, 0).astype(np.uint8) # H * W * 3
         image = cv2.resize(image, (64, 64)) # 64 * 64 * 3
 
+        '''
         if 'zoomed_image' in obs:
             zoomed_image = obs['zoomed_image'] # H * W * 3
             zoomed_image = zoomed_image.astype(np.uint8) # H * W * 3
             zoomed_image = cv2.resize(zoomed_image, (64, 64)) # 64 * 64 * 3
         else:
             zoomed_image = np.zeros_like(image)
-
+        '''
         heatmap = cv2.resize(obs['heatmap'] if 'heatmap' in obs else np.zeros((64, 64, 1)), (64, 64))
-        heatmap_on_zoomed = cv2.resize(obs['heatmap_on_zoomed'] if 'heatmap_on_zoomed' in obs else np.zeros((64, 64, 1)), (64, 64))
+        #heatmap_on_zoomed = cv2.resize(obs['heatmap_on_zoomed'] if 'heatmap_on_zoomed' in obs else np.zeros((64, 64, 1)), (64, 64))
         heatmap = np.clip(heatmap * 255, 0, 255).astype(np.uint8)
-        heatmap_on_zoomed = np.clip(heatmap_on_zoomed * 255, 0, 255).astype(np.uint8)
+        #heatmap_on_zoomed = np.clip(heatmap_on_zoomed * 255, 0, 255).astype(np.uint8)
 
         obs = {
             'image': image,
             'heatmap': heatmap,
             'jump': obs['jump'] if 'jump' in obs else False,
-            'is_zoomed': obs['is_zoomed'] if 'is_zoomed' in obs else False,
-            'is_calculated': obs['is_calculated'] if 'is_calculated' in obs else False,
+            #'is_zoomed': obs['is_zoomed'] if 'is_zoomed' in obs else False,
+            #'is_calculated': obs['is_calculated'] if 'is_calculated' in obs else False,
             'is_first': obs['is_first'],
             'is_last': obs['is_last'],
             'is_terminal': obs['is_terminal'],
-            'reward_on_zoomed': obs['reward_on_zoomed'] if 'reward_on_zoomed' in obs else 0.0,
+            #'reward_on_zoomed': obs['reward_on_zoomed'] if 'reward_on_zoomed' in obs else 0.0,
             'intrinsic': obs['intrinsic'] if 'intrinsic' in obs else 0.0,
-            'intrinsic_on_zoomed': obs['intrinsic_on_zoomed'] if 'intrinsic_on_zoomed' in obs else 0.0,
+            #'intrinsic_on_zoomed': obs['intrinsic_on_zoomed'] if 'intrinsic_on_zoomed' in obs else 0.0,
             'score': obs['score'] if 'score' in obs else 0.0,
-            'score_on_zoomed': obs['score_on_zoomed'] if 'score_on_zoomed' in obs else 0.0,
-            'jumping_steps': obs['jumping_steps'] if 'jumping_steps' in obs else 1000.0,
-            'accumulated_reward': obs['accumulated_reward'] if 'accumulated_reward' in obs else 1000.0,
+            #'score_on_zoomed': obs['score_on_zoomed'] if 'score_on_zoomed' in obs else 0.0,
+            #'jumping_steps': obs['jumping_steps'] if 'jumping_steps' in obs else 1000.0,
+            #'accumulated_reward': obs['accumulated_reward'] if 'accumulated_reward' in obs else 1000.0,
         }
-
+        '''
         if obs["is_zoomed"]:
             obs["zoomed_image"] = zoomed_image
             obs["heatmap_on_zoomed"] = heatmap_on_zoomed
         else:
             obs["zoomed_image"] = None
             obs["heatmap_on_zoomed"] = None
-
+        '''
         
         for key, value in obs.items():
             if key in self.observation_space:

@@ -885,14 +885,14 @@ def static_scan_for_lambda_return(fn, inputs, start):
     return outputs
 
 
-def lambda_return_for_ls_imagine(reward, value, gamma, end, jumping_steps, accumulated_reward, bootstrap, lambda_, axis):
+def lambda_return(reward, value, pcont, bootstrap, lambda_, axis):
     # Setting lambda=1 gives a discounted Monte Carlo return.
     # Setting lambda=0 gives a fixed 1-step return.
     # assert reward.shape.ndims == value.shape.ndims, (reward.shape, value.shape)
     assert len(reward.shape) == len(value.shape), (reward.shape, value.shape)
     
-    if isinstance(gamma, (int, float)):
-        gamma = gamma * torch.ones_like(reward)
+    if isinstance(pcont, (int, float)):
+        pcont = pcont * torch.ones_like(reward)
 
     dims = list(range(len(reward.shape)))
     dims = [axis] + dims[1:axis] + [0] + dims[axis + 1 :]
@@ -900,22 +900,25 @@ def lambda_return_for_ls_imagine(reward, value, gamma, end, jumping_steps, accum
     if axis != 0:
         reward = reward.permute(dims)
         value = value.permute(dims)
-        gamma = gamma.permute(dims)
+        pcont = pcont.permute(dims)
 
     if bootstrap is None:
         bootstrap = torch.zeros_like(value[-1])
+    
+    # 获取下一步的价值估计
     next_values = torch.cat([value[1:], bootstrap[None]], 0)
 
+    '''
     new_reward = torch.pow(gamma, jumping_steps-1) * reward + accumulated_reward
     discount = torch.pow(gamma, jumping_steps)
-            
-    inputs = new_reward + discount * next_values * (1 - lambda_)
-    # returns = static_scan(
-    #    lambda agg, cur0, cur1: cur0 + cur1 * lambda_ * agg,
-    #    (inputs, pcont), bootstrap, reverse=True)
+    '''
+    #inputs = new_reward + discount * next_values * (1 - lambda_)
+    inputs = reward + pcont * next_values * (1 - lambda_)
+
     # reimplement to optimize performance
+    #returns = static_scan_for_lambda_return(lambda agg, cur0, cur1, cur2: (1.0 - cur2) * (cur0 + cur1 * lambda_ * agg), (inputs, discount, end), bootstrap)
     returns = static_scan_for_lambda_return(
-        lambda agg, cur0, cur1, cur2: (1.0 - cur2) * (cur0 + cur1 * lambda_ * agg), (inputs, discount, end), bootstrap
+        lambda agg, cur0, cur1: (cur0 + cur1 * lambda_ * agg), (inputs, pcont), bootstrap
     )
     if axis != 0:
         returns = returns.permute(dims)
