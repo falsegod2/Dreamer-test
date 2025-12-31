@@ -24,7 +24,7 @@ affordance_map/pretrained_ckpt/*
 affordance_map/pretrained_unet_checkpoint/*
 
 # Ignore the entire logdir folder
-logdir/
+logdir/*
 
 # Ignore the entire logs folder
 logs/
@@ -43,3 +43,11 @@ weights/*
 
 # Ignore DynDream_exprs.sh
 DynDream_exprs.sh
+
+clip-vit-base-patch16/*
+
+MineCLIP/*
+
+workspace/*
+
+affordance_map/finetune_unet/*
