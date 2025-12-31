@@ -114,7 +114,7 @@ class LS_Imagine(nn.Module):
 
     def _train(self, data):
         metrics = {}
-        post, post_zoomed, context, mets = self._wm._train(data)
+        post, context, mets = self._wm._train(data)
         metrics.update(mets)
         # start = (post, post_zoomed)
 
@@ -126,23 +126,11 @@ class LS_Imagine(nn.Module):
             self._wm.dynamics.get_feat(s)
         ).mode() 
 
-        jumping_steps = lambda f, s, a: self._wm.heads["jumping_steps"](
-            f
-        ).mean().clamp_min(1).int()
-
-        accumulated_reward = lambda f, s, a: self._wm.heads["accumulated_reward"](
-            f
-        ).mode()
-
-        jump_indicator = lambda s: self._wm.heads["jump"](
-            self._wm.dynamics.get_feat(s)
-        ).mean
-
         is_end = lambda s: self._wm.heads["end"](
             self._wm.dynamics.get_feat(s)
         ).mean
 
-        metrics.update(self._task_behavior._train(post, post_zoomed, reward, intrinsic, jumping_steps, accumulated_reward, jump_indicator, is_end)[-1])
+        metrics.update(self._task_behavior._train(post, reward, intrinsic, is_end)[-1])
         if self._config.expl_behavior != "greedy":
             mets = self._expl_behavior.train(post, context, data)[-1]
             metrics.update({"expl_" + key: value for key, value in mets.items()})
