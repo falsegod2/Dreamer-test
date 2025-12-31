@@ -192,19 +192,6 @@ class WorldModel(nn.Module):
             name="End",
         )
 
-        self.heads["jump"] = networks.MLP(
-            feat_size,
-            (),
-            config.jump_head["layers"],
-            config.units,
-            config.act,
-            config.norm,
-            dist="binary",
-            outscale=config.jump_head["outscale"],
-            device=config.device,
-            name="Jump",
-        )
-
         self.heads["intrinsic"] = networks.MLP(
             feat_size,
             (255,) if config.intrinsic_head["dist"] == "symlog_disc" else (),
@@ -218,32 +205,6 @@ class WorldModel(nn.Module):
             name="Intrinsic",
         )
 
-        self.heads["jumping_steps"] = networks.MLP(
-            feat_size * 2,
-            (255,) if config.jumping_steps_head["dist"] == "symlog_disc" else (),
-            config.jumping_steps_head["layers"],
-            config.units,
-            config.act,
-            config.norm,
-            dist=config.jumping_steps_head["dist"],
-            outscale=config.jumping_steps_head["outscale"],
-            device=config.device,
-            name="jumping_steps",
-        )
-
-        self.heads["accumulated_reward"] = networks.MLP(
-            feat_size * 2,
-            (255,) if config.accumulated_reward_head["dist"] == "symlog_disc" else (),
-            config.accumulated_reward_head["layers"],
-            config.units,
-            config.act,
-            config.norm,
-            dist=config.accumulated_reward_head["dist"],
-            outscale=config.accumulated_reward_head["outscale"],
-            device=config.device,
-            name="accumulated_reward",
-        )
-       
         for name in config.grad_heads:
             assert name in self.heads, name
 
@@ -266,25 +227,23 @@ class WorldModel(nn.Module):
         self._scales = dict(
             reward=config.reward_head["loss_scale"],
             end=config.end_head["loss_scale"],
-            jump=config.jump_head["loss_scale"],
             intrinsic=config.intrinsic_head["loss_scale"],
-            jumping_steps=config.jumping_steps_head["loss_scale"],
-            accumulated_reward=config.accumulated_reward_head["loss_scale"],
         )
 
     def _train(self, data_origin):
         
-        data = self.preprocess(data_origin, zoomed=False)
-        data_zoomed = self.preprocess(data_origin, zoomed=True)
+        data = self.preprocess(data_origin)
 
+        '''
         zoomed_num = torch.sum(data["is_zoomed"]).item()
         calculated_num = torch.sum(data_zoomed["is_calculated"]).item()
+        '''
 
         with tools.RequiresGrad(self):
             with torch.cuda.amp.autocast(self._use_amp):
                 
                 embed = self.encoder(data)
-                embed_zoomed = self.encoder(data_zoomed)
+                #embed_zoomed = self.encoder(data_zoomed)
 
                 # process original data
                 post, prior = self.dynamics.observe(
@@ -304,8 +263,10 @@ class WorldModel(nn.Module):
                 preds = {}
                 for name, head in self.heads.items():
                     # When processing original data, "jumping_steps" and "accumulated_reward" are not used
+                    '''
                     if name == "jumping_steps" or name == "accumulated_reward":
                         continue
+                    '''
                     grad_head = name in self._config.grad_heads
                     feat = self.dynamics.get_feat(post)
                     feat = feat if grad_head else feat.detach()
@@ -326,7 +287,7 @@ class WorldModel(nn.Module):
                     key: value * self._scales.get(key, 1.0)
                     for key, value in losses.items()
                 }
-
+                '''
                 if zoomed_num > 0:
                     # process zoomed data
                     is_zoomed_indices = data["is_zoomed"].squeeze(-1).bool()
@@ -397,7 +358,8 @@ class WorldModel(nn.Module):
                         key: value * self._scales.get(key, 1.0)
                         for key, value in losses_zoomed.items()
                     }
-
+                '''
+                '''
                 if zoomed_num > 0:
                     kl_loss_img = kl_loss_img.reshape(-1, *kl_loss_img.shape[2:])
                     kl_loss_jmp = kl_loss_jmp.reshape(-1, *kl_loss_jmp.shape[2:])
@@ -420,31 +382,37 @@ class WorldModel(nn.Module):
                     scaled_sum = torch.cat((scaled_img, scaled_jmp * self._config.long_term_branch_weight), dim=0) # [512 + N]
                     
                     model_loss = scaled_sum + kl_loss
-
+                
                 else:
-                    kl_loss = kl_loss_img
-                    kl_value = kl_value_img
-                    dyn_loss = dyn_loss_img
-                    rep_loss = rep_loss_img
+                '''
+                kl_loss = kl_loss_img
+                kl_value = kl_value_img
+                dyn_loss = dyn_loss_img
+                rep_loss = rep_loss_img
                     
-                    model_loss = sum(scaled.values()) + kl_loss
+                model_loss = sum(scaled.values()) + kl_loss
 
             metrics = self._model_opt(torch.mean(model_loss), self.parameters())
 
         metrics.update({f"{name}_loss": to_np(torch.mean(loss)) for name, loss in losses.items()})
+
+        '''
         if zoomed_num > 0:
             metrics.update({f"zoomed_{name}_loss": to_np(torch.mean(loss)) for name, loss in losses_zoomed.items()})
-        metrics["kl_free"] = kl_free
-        metrics["dyn_scale"] = dyn_scale
-        metrics["rep_scale"] = rep_scale
+        '''
+        #metrics["kl_free"] = kl_free
+        #metrics["dyn_scale"] = dyn_scale
+        #metrics["rep_scale"] = rep_scale
         metrics["dyn_loss"] = to_np(torch.mean(dyn_loss))
         metrics["rep_loss"] = to_np(torch.mean(rep_loss))
         metrics["kl"] = to_np(torch.mean(kl_value))
+        '''
         if zoomed_num > 0:
             metrics["dyn_loss_img"] = to_np(torch.mean(dyn_loss_img))
             metrics["dyn_loss_jmp"] = to_np(torch.mean(dyn_loss_jmp))
             metrics["rep_loss_img"] = to_np(torch.mean(rep_loss_img))
             metrics["rep_loss_jmp"] = to_np(torch.mean(rep_loss_jmp))
+        '''
         metrics["model_loss"] = to_np(torch.mean(model_loss))
 
         with torch.cuda.amp.autocast(self._use_amp):
@@ -454,6 +422,7 @@ class WorldModel(nn.Module):
             metrics["post_ent"] = to_np(
                 torch.mean(self.dynamics.get_dist(post).entropy())
             )
+            '''
             if zoomed_num > 0:
                 metrics["prior_zoomed_ent"] = to_np(
                     torch.mean(self.dynamics.get_dist(prior_zoomed).entropy())
@@ -461,6 +430,7 @@ class WorldModel(nn.Module):
                 metrics["post_zoomed_ent"] = to_np(
                     torch.mean(self.dynamics.get_dist(post_zoomed).entropy())
                 )    
+            '''
             context = dict(
                 embed=embed,
                 feat=self.dynamics.get_feat(post),
@@ -469,26 +439,31 @@ class WorldModel(nn.Module):
             )
 
         post = {k: v.detach() for k, v in post.items()}
-
+        '''
         if zoomed_num > 0:
             post_zoomed = {k: v.detach() for k, v in post_zoomed.items()}
             return post, post_zoomed, context, metrics
         else:
-            return post, None, context, metrics
+        '''
+        return post, context, metrics
 
     # this function is called during both rollout and training
-    def preprocess(self, obs, zoomed=False):
+    def preprocess(self, obs):
         obs = obs.copy()
+        
+        #if not zoomed:
+        obs["image"] = torch.Tensor(obs["image"]) / 255.0
+        obs["heatmap"] = torch.Tensor(obs["heatmap"]).unsqueeze(-1) / 255.0
+        if "action" in obs:
+            '''
+            original_action = obs["action"]
+            zeros_array = np.zeros((original_action.shape[0], original_action.shape[1], 1), dtype=original_action.dtype)
+            new_action = np.concatenate((original_action, zeros_array), axis=-1)
+            obs["action"] = new_action  # [16, 64, 13]
+            '''
+            obs["action"] = obs["action"] # 保持原始维度 (如 12 维)
 
-        if not zoomed:
-            obs["image"] = torch.Tensor(obs["image"]) / 255.0
-            obs["heatmap"] = torch.Tensor(obs["heatmap"]).unsqueeze(-1) / 255.0
-            if "action" in obs:
-                original_action = obs["action"]
-                zeros_array = np.zeros((original_action.shape[0], original_action.shape[1], 1), dtype=original_action.dtype)
-                new_action = np.concatenate((original_action, zeros_array), axis=-1)
-                obs["action"] = new_action  # [16, 64, 13]
-
+        '''
         else:
             obs["is_zoomed"] = np.zeros_like(obs["is_zoomed"])
             obs["jump"] = np.zeros_like(obs["jump"])
@@ -496,18 +471,19 @@ class WorldModel(nn.Module):
             obs["heatmap"] = torch.Tensor(obs["heatmap_on_zoomed"]).unsqueeze(-1) / 255.0
             obs["reward"] = obs["reward_on_zoomed"]
             obs['intrinsic'] = obs['intrinsic_on_zoomed']
-            
+        
             # for states after zooming, clear the action and add it to 13th dimension, and set the last dimension to 1
             if "action" in obs:
                 new_action = np.zeros((obs["action"].shape[0], obs["action"].shape[1], obs["action"].shape[2] + 1), dtype=obs["action"].dtype) # [64, 16, 13]
                 new_action[:, :, -1] = 1
                 obs["action"] = new_action
-            
+        '''
+        '''
         obs.pop("zoomed_image", None)
         obs.pop("heatmap_on_zoomed", None)
         obs.pop("reward_on_zoomed", None)
         obs.pop("intrinsic_on_zoomed", None)
-
+        '''
         if "discount" in obs:
             obs["discount"] *= self._config.discount
             obs["discount"] = torch.Tensor(obs["discount"]).unsqueeze(-1)
@@ -516,18 +492,21 @@ class WorldModel(nn.Module):
         # 'is_terminal' is necesarry to train end_head
         assert "is_terminal" in obs
 
+        '''
         if zoomed:
             obs['is_first'] = np.zeros_like(obs['is_first'])
-
+        '''
+        '''
         obs["is_zoomed"] = torch.Tensor(obs["is_zoomed"]).unsqueeze(-1)
         obs["jump"] = torch.Tensor(obs["jump"]).unsqueeze(-1)
         obs["is_calculated"] = torch.Tensor(obs["is_calculated"]).unsqueeze(-1)
+        '''
         obs["end"] = torch.Tensor(obs["is_terminal"]).unsqueeze(-1)
         obs = {k: torch.Tensor(v).to(self._config.device) for k, v in obs.items()}
         return obs
 
     def video_pred(self, data):
-        data = self.preprocess(data, zoomed=False)
+        data = self.preprocess(data)
         embed = self.encoder(data)
 
         states, _ = self.dynamics.observe(
@@ -628,12 +607,12 @@ class ImagBehavior(nn.Module):
     def _train(
         self,
         start,
-        start_zoomed,
+        #start_zoomed,
         objective,
         intrinsic_objective,
-        jumping_steps_predictor,
-        accumulated_reward_predictor,
-        jump_indicator,
+        #jumping_steps_predictor,
+        #accumulated_reward_predictor,
+        #jump_indicator,
         is_end,
     ):
 
@@ -645,11 +624,12 @@ class ImagBehavior(nn.Module):
                 # add post-jump state to start
                 flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
                 start = {k: flatten(v) for k, v in start.items()} # [512, xx, xx]
+                '''
                 if start_zoomed is not None and self.jump_prob > 0.0:
                     start_zoomed = {k: flatten(v) for k, v in start_zoomed.items()} # [n, xx, xx]
                     for k, v in start.items():
                         start[k] = torch.cat((v, start_zoomed[k]), dim=0) # shape: [N = 512 + n, xx, xx]
-
+                '''
                 state_num = start['deter'].shape[0] # 512 or N
 
                 imag_state = {} # [L, N, xx, xx]
@@ -659,7 +639,7 @@ class ImagBehavior(nn.Module):
                 action_example = self.actor(self._world_model.dynamics.get_feat(start).detach()).sample()
                 action_dimension = action_example.shape[-1]
 
-                jump_record = torch.empty((0, state_num), device=self._config.device) # [0, N]
+                #jump_record = torch.empty((0, state_num), device=self._config.device) # [0, N]
                 imag_action = torch.empty((0, state_num, action_dimension), device=self._config.device) # [0, N, xx]
 
                 for _ in range (self._config.imag_horizon - 1):
@@ -668,24 +648,29 @@ class ImagBehavior(nn.Module):
                         checking_state[key] = tensor[-1, :, ...]
 
                     # check if checking_state can jump
+                    '''
                     jump_tensor = jump_indicator(checking_state) # [N, 1]
                     end_factor = is_end(checking_state) # [N, 1]
                     indices = probability_to_bool(jump_tensor * (1.0 - end_factor), self.jump_prob).squeeze() # [N]
+                    '''
+                    '''
                     jump_record = torch.cat((jump_record, indices.unsqueeze(0)), dim=0) # [L, N]
-
+                    '''
+                    '''
                     jump_state = {} # [X, xx, xx]
                     for key, tensor in checking_state.items():
                         jump_state[key] = tensor[indices]
-
+                    
                     # for states identified as requiring a jumpy transition, execute long-term imagination.
                     _, state_after_jumping, _ = self._jumpy(
                         jump_state, self.actor, 1
                     )
-
+                    '''
+                    '''
                     _, state_after_jumping, _ = self._imagine(
                         state_after_jumping, self.actor, 1
                     ) # [X, xx, xx]
-
+                    '''
                     # For other states, execute short-term imagination.
                     _, state_after_imagination, ac = self._imagine(
                         checking_state, self.actor, 1
@@ -693,18 +678,19 @@ class ImagBehavior(nn.Module):
 
                     # save action for this step to imag_action
                     imag_action = torch.cat((imag_action, ac.unsqueeze(0)), dim=0)
- 
+
+                    '''
                     for key in state_after_imagination:
                         state_after_imagination[key][indices] = state_after_jumping[key]
-
+                    '''
                     for key in imag_state:
                         imag_state[key] = torch.cat((imag_state[key], state_after_imagination[key].unsqueeze(0)), dim=0)
 
-
+                '''
                 last_jump_record = torch.zeros((1, state_num), device=self._config.device) # [1, N]
                 jump_record = torch.cat((jump_record, last_jump_record), dim=0) # [L, N]
                 jump_num = torch.sum(jump_record)
-
+                '''
                 imag_feat = self._world_model.dynamics.get_feat(imag_state) # [L, N, xx, xx]
                 inp = imag_feat[-1].detach()
                 last_imag_action = self.actor(inp).sample() # [N, xx, xx]
@@ -712,16 +698,18 @@ class ImagBehavior(nn.Module):
 
                 #  Data augmentation (using the state after long-term transition as the starting point for a new imagination sequence)
                 new_state = {}
-
+                '''
                 new_jump_tensor = jump_indicator(imag_state) # [L, N, 1]
                 new_end_factor = is_end(imag_state) # [L, N, 1]
                 zoom_indices = new_jump_tensor * (1.0 - new_end_factor)
-
+                '''
+                '''
                 max_values, _ = zoom_indices.max(dim=0, keepdim=True)
                 max_mask = (zoom_indices == max_values)
                 zoom_indices *= max_mask.float()
                 zoom_indices = probability_to_bool(zoom_indices, self.jump_prob).squeeze() # [L, N]
-
+                '''
+                '''
                 new_num = torch.sum(zoom_indices) # Y
 
                 for key, tensor in imag_state.items():
@@ -738,16 +726,18 @@ class ImagBehavior(nn.Module):
                 new_feat, new_state_sequence, new_action = self._imagine(
                     new_state_after_jump, self.actor, self._config.imag_horizon
                 ) # [L, N, xx, xx]
-
+                '''
+                '''
                 new_jump_record = torch.zeros((self._config.imag_horizon, new_num), device=self._config.device) # [L, Y]
 
                 for key, tensor in imag_state.items():
                     imag_state[key] = torch.cat((tensor, new_state_sequence[key]), dim=1) # [L, N+Y, xx, xx]
-
+                '''
+                '''
                 imag_feat = torch.cat((imag_feat, new_feat), dim=1) # [L, N+Y, xx]
                 imag_action = torch.cat((imag_action, new_action), dim=1) # [L, N+Y, 12]
                 jump_record = torch.cat((jump_record, new_jump_record), dim=1) # [L, N+Y]
-
+                '''
                 imagination_num_tensor = torch.tensor(state_num, dtype=torch.float32, device=imag_feat.device)
                 
                 reward = objective(imag_feat, imag_state, imag_action)
@@ -759,21 +749,21 @@ class ImagBehavior(nn.Module):
                 actor_ent = self.actor(imag_feat).entropy() 
                 state_ent = self._world_model.dynamics.get_dist(imag_state).entropy()
 
+                '''
                 jump_sequence_record = torch.any(jump_record, dim=0, keepdim=True).repeat(jump_record.size(0), 1) # [L, N]
                 jump_record_tensor = jump_record.unsqueeze(-1) # [L, N, 1]
                 jump_sequence_record = jump_sequence_record.unsqueeze(-1) # [L, N, 1]
-
-                target, weights, base = self._compute_target(
-                    imag_feat, imag_state, reward, jump_record_tensor, jumping_steps_predictor, accumulated_reward_predictor, is_end
+                '''
+                target_TD_lambda_Return, weights, base = self._compute_target(
+                    imag_feat, imag_state, reward, is_end
                 )
 
                 actor_loss, mets = self._compute_actor_loss(
                     imag_feat,
                     imag_action,
-                    target,
+                    target_TD_lambda_Return,
                     weights,
                     base,
-                    jump_record_tensor,
                 )
 
                 actor_loss -= self._config.actor["entropy"] * actor_ent[:-1, ..., None]
@@ -784,16 +774,16 @@ class ImagBehavior(nn.Module):
         with tools.RequiresGrad(self.value):
             with torch.cuda.amp.autocast(self._use_amp):
                 value = self.value(value_input[:-1].detach())
-                target = torch.stack(target, dim=1)
+                target_TD_lambda_Return = torch.stack(target_TD_lambda_Return, dim=1)
 
-                value_loss = -value.log_prob(target.detach())
+                value_loss = -value.log_prob(target_TD_lambda_Return.detach())
                 slow_target = self._slow_value(value_input[:-1].detach())
                 if self._config.critic["slow_target"]:
                     value_loss -= value.log_prob(slow_target.mode().detach())
                 value_loss = torch.mean(weights[:-1] * value_loss[:, :, None])
 
         metrics.update(tools.tensorstats(value.mode(), "value"))
-        metrics.update(tools.tensorstats(target, "target"))
+        metrics.update(tools.tensorstats(target_TD_lambda_Return, "target_TD_lambda_Return"))
         metrics.update(tools.tensorstats(reward, "imag_reward"))
         metrics.update(tools.tensorstats(imagination_num_tensor, "imagination_num"))
 
@@ -811,7 +801,12 @@ class ImagBehavior(nn.Module):
             metrics.update(self._value_opt(value_loss, self.value.parameters()))
         return imag_feat, imag_state, imag_action, weights, metrics
 
-    def save_state_sequence(self, imag_feat, jump_record, freq=0.1):
+    #可视化“想象”过程
+    def save_state_sequence(self, imag_feat, freq=0.1):
+        """
+        为 Dreamer 框架简化的想象序列可视化函数。
+        移除了对 jump_record 的依赖。
+        """
         if random.random() > freq:
             return
 
@@ -819,24 +814,12 @@ class ImagBehavior(nn.Module):
         os.makedirs(output_dir, exist_ok=True)
         current_time = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-        num_rows, num_cols, _ = jump_record.shape
-        if torch.sum(jump_record) == 0:
-            random_num = 0.0
-        else:
-            random_num = np.random.rand()
-
-        if random_num < 0.5:
-            random_index = np.random.randint(num_cols)
-        else:
-            valid_indices = torch.any(jump_record.squeeze(-1), dim=0).nonzero().squeeze()
-
-            if valid_indices.ndim == 0: 
-                random_index = valid_indices.item()
-            else:
-                random_index = valid_indices[torch.randint(len(valid_indices), (1,)).item()].item()
-
+        # imag_feat 形状通常为 [L, N, Feat_Size] (L为时间步，N为Batch大小)
+        num_steps, batch_size, _ = imag_feat.shape
+        
+        # 1. 随机选择 Batch 中的一个序列进行可视化
+        random_index = np.random.randint(batch_size)
         feats = imag_feat[:, random_index, :] 
-        jump_record = jump_record[:, random_index]  
 
         def tensor_to_image(tensor):
             array = tensor.detach().cpu().numpy().astype(np.uint8)
@@ -856,46 +839,44 @@ class ImagBehavior(nn.Module):
             heatmap = heatmap.convert("RGB")
             return Image.blend(image, heatmap, alpha)
 
+        # 2. 解码图像序列
         image_list = []
         for feat in feats:
+            # 增加维度以匹配 Decoder 输入 [1, 1, Feat_Size]
             feat = feat.unsqueeze(0).unsqueeze(0)
 
+            # 解码原始图像
             image_tensor = self._world_model.heads["decoder"](feat)["image"].mode()
             image_tensor = image_tensor.squeeze(0).squeeze(0)
             image_tensor = torch.clamp(image_tensor, min=0.0, max=1.0) * 255.0
             image = tensor_to_image(image_tensor)
 
+            # 解码热力图 (如果有)
             heatmap_tensor = self._world_model.heads["decoder"](feat)["heatmap"].mode()
             heatmap_tensor = heatmap_tensor.squeeze(0).squeeze(0)
             heatmap_tensor = torch.clamp(heatmap_tensor, min=0.0, max=1.0)
             heatmap = apply_colormap_to_heatmap(heatmap_tensor, cmap='jet', vmin=0, vmax=1)
 
+            # 混合图像
             blended_image = blend_images(image, heatmap, alpha=0.3)
-
             image_list.append((image, heatmap, blended_image))
 
+        # 3. 拼接并保存图像 (统一使用蓝色边框)
         border_width = 2
-
         total_width = sum(img.width for img, _, _ in image_list) + border_width * len(image_list) * 2
         max_height = max(img.height for img, _, _ in image_list) + border_width * 2
         composite_image = Image.new('RGB', (total_width, max_height * 3), color='white')
 
         x_offset = 0
+        border_color = 'blue' # 统一边框颜色
 
         for i, (orig_img, heatmap, blended_img) in enumerate(image_list):
             for row_idx, img in enumerate([orig_img, heatmap, blended_img]):
                 y_offset = max_height * row_idx
-
-                if jump_record[i] == 1:
-                    border_color = 'red'
-                else:
-                    border_color = 'blue'
-
+                # 绘制带边框的图像
                 bordered_img = Image.new('RGB', (img.width + border_width * 2, img.height + border_width * 2), border_color)
                 bordered_img.paste(img, (border_width, border_width))
-
                 composite_image.paste(bordered_img, (x_offset, y_offset))
-
             x_offset += orig_img.width + border_width * 2
 
         composite_image.save(os.path.join(output_dir, f"{current_time}.png"))
@@ -910,11 +891,13 @@ class ImagBehavior(nn.Module):
             inp = feat.detach()
             action = policy(inp).sample()
             
+            '''
             # When interacting with the wm, the action needs to be expanded to 13 dimensions.
             zeros_tensor = torch.zeros(action.shape[0], 1).to(action.device)
             new_action = torch.cat((action, zeros_tensor), dim=-1)
+            '''
             
-            succ = dynamics.img_step(state, new_action)
+            succ = dynamics.img_step(state, action)
             return succ, feat, action
 
         succ, feats, actions = tools.static_scan(
@@ -932,6 +915,7 @@ class ImagBehavior(nn.Module):
         else:
             return feats, states, actions
 
+    '''
     def _jumpy(self, start, policy, horizon):
         dynamics = self._world_model.dynamics
 
@@ -959,60 +943,64 @@ class ImagBehavior(nn.Module):
             return feats, succ, actions
         else:
             return feats, states, actions
-
-    def _compute_target(self, imag_feat, imag_state, reward, jump_record, jumping_steps_predictor, accumulated_reward_predictor, is_end):
+    '''
+            
+    def _compute_target(self, imag_feat, imag_state, reward, is_end):
         fc = torch.cat((imag_feat[:-1], imag_feat[1:]), dim=-1) # [L - 1, N, 2xx]
+        '''
         jumping_steps = jumping_steps_predictor(fc, None, None) # [L - 1, N, 1]
         jumping_steps = torch.cat([jumping_steps, torch.zeros_like(jumping_steps[0]).unsqueeze(0)], dim=0) # [L, N, 1]
         accumulated_reward = accumulated_reward_predictor(fc, None, None) # [L - 1, N, 1]
         accumulated_reward = torch.cat([accumulated_reward, torch.zeros_like(accumulated_reward[0]).unsqueeze(0)], dim=0) # [L, N, 1]
         accumulated_reward *= self.gamma_sum[(jumping_steps - 2).clamp(0, self._config.episode_max_steps - 1)]
-        
+        '''
         end = is_end(imag_state) # [L, N, 1]
-        gamma = self._config.discount * torch.ones_like(reward)
+        discount = self._config.discount * torch.ones_like(reward)
         value = self.value(imag_feat).mode()
-        
+        '''
         jumping_steps = (jumping_steps - 1) * jump_record + 1
         accumulated_reward *= jump_record
-        discount = gamma * (1.0 - end)
+        '''
+        discount = discount * (1.0 - end)
         
-        target = tools.lambda_return_for_ls_imagine(
+        #Critic 的训练目标（实际回报目标）
+        target_TD_lambda_Return = tools.lambda_return(
             reward[1:],
             value[:-1],
-            gamma[:-1],
-            end[:-1],
-            jumping_steps[:-1],
-            accumulated_reward[:-1],
+            discount[:-1],
+            #end[:-1],
+            #jumping_steps[:-1],
+            #accumulated_reward[:-1],
             bootstrap=value[-1],
             lambda_=self._config.discount_lambda,
             axis=0,
         )
         
-        self.save_state_sequence(imag_feat, jump_record)
+        self.save_state_sequence(imag_feat)
         
         weights = torch.cumprod(
             torch.cat([torch.ones_like(discount[:1]), discount[:-1]], 0), 0
         ).detach()
 
-        return target, weights, value[:-1]
+        return target_TD_lambda_Return, weights, value[:-1]
 
     def _compute_actor_loss(
         self,
         imag_feat,
         imag_action,
-        target,
+        target_TD_lambda_Return,
         weights,
         base,
-        jump_record,
+        #jump_record,
     ):
         metrics = {}
         inp = imag_feat.detach()
         policy = self.actor(inp)
         # Q-val for actor is not transformed using symlog
-        target = torch.stack(target, dim=1)
+        target_TD_lambda_Return = torch.stack(target_TD_lambda_Return, dim=1)
         if self._config.reward_EMA:
-            offset, scale = self.reward_ema(target, self.ema_vals)
-            normed_target = (target - offset) / scale
+            offset, scale = self.reward_ema(target_TD_lambda_Return, self.ema_vals)
+            normed_target = (target_TD_lambda_Return - offset) / scale
             normed_base = (base - offset) / scale
             adv = normed_target - normed_base
             metrics.update(tools.tensorstats(normed_target, "normed_target"))
@@ -1024,21 +1012,22 @@ class ImagBehavior(nn.Module):
         elif self._config.imag_gradient == "reinforce":
             actor_target = (
                 policy.log_prob(imag_action)[:-1][:, :, None]
-                * (target - self.value(imag_feat[:-1]).mode()).detach()
+                * (target_TD_lambda_Return - self.value(imag_feat[:-1]).mode()).detach()
             )
         elif self._config.imag_gradient == "both":
             actor_target = (
                 policy.log_prob(imag_action)[:-1][:, :, None]
-                * (target - self.value(imag_feat[:-1]).mode()).detach()
+                * (target_TD_lambda_Return - self.value(imag_feat[:-1]).mode()).detach()
             )
             mix = self._config.imag_gradient_mix
-            actor_target = mix * target + (1 - mix) * actor_target
+            actor_target = mix * target_TD_lambda_Return + (1 - mix) * actor_target
             metrics["imag_gradient_mix"] = mix
         else:
             raise NotImplementedError(self._config.imag_gradient)
         
-        jump_mask = 1.0 - jump_record
-        actor_loss = -weights[:-1] * jump_mask[:-1] * actor_target
+        #jump_mask = 1.0 - jump_record
+        #actor_loss = -weights[:-1] * jump_mask[:-1] * actor_target
+        actor_loss = -weights[:-1] * actor_target
 
         return actor_loss, metrics
 
