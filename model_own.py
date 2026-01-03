@@ -155,6 +155,14 @@ class WorldModel(nn.Module):
             config.device,
         )
 
+        #CORE
+        #初始化 Affordance 生成器 (MCUnet)
+        self.mc_unet = MCUnet(config.mc_unet_config)
+        #信号分支
+        self.dynamics_signal = self.dynamics
+        #噪声分支
+        self.dynamics_distractor = copy.deepcopy(self.dynamics)
+
         self.heads = nn.ModuleDict()
 
         if config.dyn_discrete:

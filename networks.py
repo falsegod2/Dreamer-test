@@ -509,14 +509,16 @@ class MultiEncoder(nn.Module):
             )
             self.outdim += mlp_units
 
-    def forward(self, obs):
+    def forward(self, obs, Taskmask = None):
         outputs = []
         if self.cnn_shapes:
             inputs = torch.cat([obs[k] for k in self.cnn_shapes], -1)
-            outputs.append(self._cnn(inputs))
+            outputs.append(self._cnn(inputs, Taskmask = Taskmask))
+        '''
         if self.mlp_shapes:
             inputs = torch.cat([obs[k] for k in self.mlp_shapes], -1)
             outputs.append(self._mlp(inputs))
+        '''
         outputs = torch.cat(outputs, -1)
         return outputs
 
@@ -645,13 +647,30 @@ class ConvEncoder(nn.Module):
         self.layers = nn.Sequential(*layers)
         self.layers.apply(tools.weight_init)
 
-    def forward(self, obs):
+    def forward(self, obs, Taskmask = None):
         obs -= 0.5
         # (batch, time, h, w, ch) -> (batch * time, h, w, ch)
         x = obs.reshape((-1,) + tuple(obs.shape[-3:]))
         # (batch * time, h, w, ch) -> (batch * time, ch, h, w)
         x = x.permute(0, 3, 1, 2)
+        # 提取中间层特征图
         x = self.layers(x)
+
+        #CORE
+        #在特征空间对obs进行掩码操作
+        if Taskmask is not None:
+            # 获取当前特征图的分辨率 (h, w)
+            h, w = x.shape[-2:]
+            
+            # 将 mask (B, T, 1, H, W) 展平并对齐到特征图尺寸
+            # 使用双线性插值，align_corners=False 保证几何中心对齐
+            b, t, c_m, h_m, w_m = Taskmask.shape
+            mask_flat = Taskmask.reshape(b * t, c_m, h_m, w_m)
+            mask_resized = F.interpolate(mask_flat, size=(h, w), mode='bilinear', align_corners=False)
+            
+            # 执行空间分拣 (Element-wise multiplication)
+            x = x * mask_resized
+
         # (batch * time, ...) -> (batch * time, -1)
         x = x.reshape([x.shape[0], np.prod(x.shape[1:])])
         # (batch * time, -1) -> (batch, time, -1)
