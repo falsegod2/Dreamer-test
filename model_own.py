@@ -94,6 +94,10 @@ class MCUnet(nn.Module):
         """加载预训练权重，包含针对性的键名处理"""
         pretrained_path = config.MODEL.PRETRAIN_CKPT
         if pretrained_path is not None:
+            if not os.path.isfile(pretrained_path):
+                logger.warning("预训练权重路径不存在：%s", pretrained_path)
+                return
+
             print("pretrained_path:{}".format(pretrained_path))
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             pretrained_dict = torch.load(pretrained_path, map_location=device)
@@ -119,8 +123,14 @@ class MCUnet(nn.Module):
                     full_dict.update({current_k:v})
             for k in list(full_dict.keys()):
                 if k in model_dict:
-                    if full_dict[k].shape != model_dict[k].shape:
-                        print("delete:{};shape pretrain:{};shape model:{}".format(k,v.shape,model_dict[k].shape))
+                    pretrained_weight = full_dict[k]
+                    model_weight = model_dict[k]
+                    if pretrained_weight.shape != model_weight.shape:
+                        print(
+                            "delete:{};shape pretrain:{};shape model:{}".format(
+                                k, pretrained_weight.shape, model_weight.shape
+                            )
+                        )
                         del full_dict[k]
 
             msg = self.swin_unet.load_state_dict(full_dict, strict=False)
