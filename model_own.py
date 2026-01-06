@@ -129,6 +129,60 @@ class MCUnet(nn.Module):
             print("none pretrain")
 
 
+class MCUnetConfig:
+    class AUG:
+        AUTO_AUGMENT = "rand-m9-mstd0.5-inc1"
+        COLOR_JITTER = 0.4
+        CUTMIX = 1.0
+        CUTMIX_MINMAX = None
+        MIXUP = 0.8
+        MIXUP_MODE = "batch"
+        MIXUP_PROB = 1.0
+        MIXUP_SWITCH_PROB = 0.5
+        RECOUNT = 1
+        REMODE = "pixel"
+        REPROB = 0.25
+
+    class DATA:
+        BATCH_SIZE = 72
+        CACHE_MODE = "part"
+        DATASET = "imagenet"
+        DATA_PATH = ""
+        IMG_SIZE = 224
+        INTERPOLATION = "bicubic"
+        NUM_WORKERS = 8
+        PIN_MEMORY = True
+        ZIP_MODE = False
+
+    class MODEL:
+        DROP_PATH_RATE = 0.2
+        DROP_RATE = 0.0
+        HEADS = 8
+        LABEL_SMOOTHING = 0.1
+        NAME = "swin_tiny_patch4_window7_224"
+        NUM_CLASSES = 1000
+        PRETRAIN_CKPT = ""
+        RESUME = ""
+        SWIN = type('SWIN', (), {
+            'APE': False,
+            'DECODER_DEPTHS': [2, 2, 2, 1],
+            'DEPTHS': [2, 2, 2, 2],
+            'EMBED_DIM': 96,
+            'FINAL_UPSAMPLE': "expand_first",
+            'IN_CHANS': 3,
+            'MLP_RATIO': 4.0,
+            'NUM_HEADS': [3, 6, 12, 24],
+            'PATCH_NORM': True,
+            'PATCH_SIZE': 4,
+            'QKV_BIAS': True,
+            'QK_SCALE': None,
+            'WINDOW_SIZE': 7
+        })
+        TEXT_FEATURE_DIM = 512
+        TYPE = "swin"
+
+
+
 class WorldModel(nn.Module):
     def __init__(self, obs_space, act_space, step, config):
         super(WorldModel, self).__init__()
@@ -157,19 +211,17 @@ class WorldModel(nn.Module):
         )
         
         #CORE1
-        from affordance_map.config import _C as mc_unet_cfg 
-        self.mc_unet_cfg = mc_unet_cfg.clone()
-        # 根据你的需求调整，例如：
-        self.mc_unet_cfg.MODEL.SWIN.DEPTHS = [2, 2, 2, 2]
-        self.mc_unet_cfg.MODEL.SWIN.DECODER_DEPTHS = [2, 2, 2, 1]
-        
-        # 2. 初始化 MCUnet 并加载参数
-        self.mc_unet = MCUnet(self.mc_unet_cfg, img_size=224, num_classes=1).to(config.device)
+        # --- MCUnet 加载部分 ---
+        # 使用本地定义的 MCUnetConfig 避开 yacs 依赖
+        self.mc_unet = MCUnet(MCUnetConfig, img_size=224, num_classes=1).to(config.device)
+
         # 加载你训练好的模型权重
         unet_ckpt = os.path.join("affordance_map/finetune_unet/finetune_checkpoints/harvest_log_in_plains", 'swin_unet_checkpoint.pth')
         if os.path.exists(unet_ckpt):
             self.mc_unet.load_state_dict(torch.load(unet_ckpt, map_location=config.device))
             print(f"Successfully loaded MCUnet from {unet_ckpt}")
+        else:
+            print(f"Warning: MCUnet checkpoint not found at {unet_ckpt}!")
         self.mc_unet.eval()
 
         # 2. 定义双分支动力学
