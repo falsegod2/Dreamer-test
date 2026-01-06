@@ -254,7 +254,7 @@ class WorldModel(nn.Module):
 
         self.mc_unet = MCUnet(MCUnetConfig, img_size=224, num_classes=1).cuda()
         snapshot = os.path.join("affordance_map/finetune_unet/finetune_checkpoints/harvest_log_in_plains", 'swin_unet_checkpoint.pth')
-        msg = self.unet.load_state_dict(torch.load(snapshot))
+        msg = self.mc_unet.load_state_dict(torch.load(snapshot))
         print("self trained swin unet",msg)
         print(f"Successfully loaded MCUnet from {snapshot}")
         self.mc_unet.eval()
