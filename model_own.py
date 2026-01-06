@@ -137,6 +137,7 @@ class WorldModel(nn.Module):
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()} # 'image': (64, 64, 3)
         self.encoder = networks.MultiEncoder(shapes, **config.encoder)
         self.embed_size = self.encoder.outdim
+
         self.dynamics = networks.RSSM(
             config.dyn_stoch,
             config.dyn_deter,
@@ -154,6 +155,29 @@ class WorldModel(nn.Module):
             self.embed_size,
             config.device,
         )
+        
+        #CORE1
+        from affordance_map.config import _C as mc_unet_cfg 
+        self.mc_unet_cfg = mc_unet_cfg.clone()
+        # 根据你的需求调整，例如：
+        self.mc_unet_cfg.MODEL.SWIN.DEPTHS = [2, 2, 2, 2]
+        self.mc_unet_cfg.MODEL.SWIN.DECODER_DEPTHS = [2, 2, 2, 1]
+        
+        # 2. 初始化 MCUnet 并加载参数
+        self.mc_unet = MCUnet(self.mc_unet_cfg, img_size=224, num_classes=1).to(config.device)
+        # 加载你训练好的模型权重
+        unet_ckpt = os.path.join("affordance_map/finetune_unet/finetune_checkpoints/harvest_log_in_plains", 'swin_unet_checkpoint.pth')
+        if os.path.exists(unet_ckpt):
+            self.mc_unet.load_state_dict(torch.load(unet_ckpt, map_location=config.device))
+            print(f"Successfully loaded MCUnet from {unet_ckpt}")
+        self.mc_unet.eval()
+
+        # 2. 定义双分支动力学
+        # 信号分支：任务相关，受控
+        self.dynamics_s = self.dynamics # 复用原有的 dynamics 配置
+        # 干扰分支：任务无关，不受控
+        self.dynamics_d = copy.deepcopy(self.dynamics)       
+        #CORE1
 
         self.heads = nn.ModuleDict()
 
@@ -162,8 +186,10 @@ class WorldModel(nn.Module):
         else:
             feat_size = config.dyn_stoch + config.dyn_deter
 
+        #维度变为 feat_size * 2
+        #CORE1
         self.heads["decoder"] = networks.MultiDecoder(
-            feat_size, shapes, **config.decoder
+            feat_size * 2, shapes, **config.decoder # 接收拼接后的 feat_s 和 feat_d
         )
 
         self.heads["reward"] = networks.MLP(
@@ -243,9 +269,45 @@ class WorldModel(nn.Module):
         with tools.RequiresGrad(self):
             with torch.cuda.amp.autocast(self._use_amp):
                 
+                #CORE1
+                # --- 步骤 1: 生成空间掩码 (Affordance Mask) ---
+                # data['p'] 是任务目标文本嵌入
+                # 注意：MCUnet 输出是 [B*T, 1, 224, 224]
+                # out_mask 形状: (B*T, 1, 224, 224)
+                aff_mask_flat = self.mc_unet(data['image'], data['p']) 
+                # 还原维度以配合 Encoder 处理 (B, T, 1, H, W)
+                aff_mask = aff_mask_flat.reshape(
+                    data['image'].shape[0], data['image'].shape[1], 1, 
+                    aff_mask_flat.shape[-2], aff_mask_flat.shape[-1]
+                )
+                
+                # --- 步骤 2: 空间特征分拣 (Encoder 侧介入) ---
+                # 提取“受控且任务相关”特征 (Signal)
+                embed_s = self.encoder(data, mask=aff_mask)
+                # 提取“任务无关干扰”特征 (Distractor)
+                embed_d = self.encoder(data, mask=(1.0 - aff_mask))
+
+                # --- 步骤 3: 双流动力学观察 (RSSM 侧介入) ---
+                post_s, prior_s = self.dynamics_s.observe(embed_s, data["action"], data["is_first"])
+                # 干扰分支传入零动作，使其学习背景动态
+                post_d, prior_d = self.dynamics_d.observe(embed_d, torch.zeros_like(data["action"]), data["is_first"])
+
+                # KL 损失 (加权控制信息带宽)
+                kl_free = self._config.kl_free # 1.0
+                dyn_scale = self._config.dyn_scale # 0.5
+                rep_scale = self._config.rep_scale # 0.1
+
+                kl_loss_s, kl_val_s, dyn_loss_s, rep_loss_s = self.dynamics_s.kl_loss(post_s, prior_s, kl_free, dyn_scale, rep_scale)
+                kl_loss_d, kl_val_d, dyn_loss_d, rep_loss_d = self.dynamics_d.kl_loss(post_d, prior_d, kl_free, dyn_scale, rep_scale)
+
+
+                # --- 步骤 4: 提取解耦特征 ---
+                feat_s = self.dynamics_s.get_feat(post_s)
+                feat_d = self.dynamics_d.get_feat(post_d)         
+                #CORE1
+                '''
                 embed = self.encoder(data)
                 #embed_zoomed = self.encoder(data_zoomed)
-
                 # process original data
                 post, prior = self.dynamics.observe(
                     embed, data["action"], data["is_first"]
@@ -260,7 +322,37 @@ class WorldModel(nn.Module):
                 )
 
                 assert kl_loss_img.shape == embed.shape[:2], kl_loss_img.shape
+                '''
+                #CORE1
+                # --- 步骤 5: 各个预测头 (Heads) 的分流逻辑 ---
+                preds = {}
+                for name, head in self.heads.items():
+                    grad_head = name in self._config.grad_heads
+                    
+                    # A. 任务相关 Head: 只看信号分支 (Reward & End)
+                    # 科学性：梯度只回传给信号分支和 Mask，倒逼模型把有用信息分拣出来
+                    if name in ["reward", "end"]:
+                        feat = feat_s
+                    
+                    # B. 重构 Head: 组合两分支特征以还原全景图像
+                    # 科学性：保证世界模型对环境有全量感知
+                    elif name == "decoder":
+                        feat = torch.cat([feat_s, feat_d], dim=-1)
+                    
+                    # C. 其他辅助任务 Head (如有)
+                    else:
+                        feat = feat_s
 
+                    # 梯度控制与前向
+                    feat = feat if grad_head else feat.detach()
+                    pred = head(feat)
+                    
+                    if type(pred) is dict:
+                        preds.update(pred)
+                    else:
+                        preds[name] = pred
+                #CORE1
+                """
                 preds = {}
                 for name, head in self.heads.items():
                     # When processing original data, "jumping_steps" and "accumulated_reward" are not used
@@ -277,11 +369,11 @@ class WorldModel(nn.Module):
                         preds.update(pred)
                     else:
                         preds[name] = pred
-                        
+                """
                 losses = {}
                 for name, pred in preds.items():
                     loss = -pred.log_prob(data[name])
-                    assert loss.shape == embed.shape[:2], (name, loss.shape)
+                    #assert loss.shape == embed.shape[:2], (name, loss.shape)
                     losses[name] = loss
                     
                 scaled = {
@@ -289,114 +381,43 @@ class WorldModel(nn.Module):
                     for key, value in losses.items()
                 }
                 '''
-                if zoomed_num > 0:
-                    # process zoomed data
-                    is_zoomed_indices = data["is_zoomed"].squeeze(-1).bool()
-                    is_calculated_mask = data["is_calculated"][is_zoomed_indices]
-                    embed_zoomed = embed_zoomed[is_zoomed_indices].unsqueeze(1)
-                    for key, value in data_zoomed.items():
-                        data_zoomed[key] = value[is_zoomed_indices].unsqueeze(1)
-
-                    selected_post = dict()
-                    selected_prior = dict()
-                    
-                    for key, value in post.items():
-                        selected_post[key] = value[is_zoomed_indices].unsqueeze(1)
-
-                    for key, value in prior.items():
-                        selected_prior[key] = value[is_zoomed_indices].unsqueeze(1)
-
-                    post_zoomed, prior_zoomed = self.dynamics.observe_zoomed(
-                        embed_zoomed, data_zoomed["action"], data_zoomed["is_first"], selected_post, selected_prior
-                    )
-                    
-                    kl_loss_jmp, kl_value_jmp, dyn_loss_jmp, rep_loss_jmp = self.dynamics.kl_loss(
-                        post_zoomed, prior_zoomed, kl_free, dyn_scale, rep_scale
-                    )
-
-                    assert kl_loss_jmp.shape == embed_zoomed.shape[:2], kl_loss_jmp.shape
-
-                    preds_zoomed = {}
-                    for name, head in self.heads.items():
-                        grad_head_zoomed = name in self._config.grad_heads
-
-                        if name == "jumping_steps" or name == "accumulated_reward":
-                            feat_zoomed = self.dynamics.get_feat(post_zoomed)
-                            feat_before_zoom = self.dynamics.get_feat(selected_post)
-                            feat_concat = torch.concat([feat_before_zoom, feat_zoomed], dim=-1)
-
-                            feat_concat = feat_concat if grad_head_zoomed else feat_concat.detach()
-                            pred_zoomed = head(feat_concat)
-
-                        else:
-                            feat_zoomed = self.dynamics.get_feat(post_zoomed)
-                            feat_zoomed = feat_zoomed if grad_head_zoomed else feat_zoomed.detach()
-                            pred_zoomed = head(feat_zoomed)
-                            
-                        if type(pred_zoomed) is dict:
-                            preds_zoomed.update(pred_zoomed)
-                        else:
-                            preds_zoomed[name] = pred_zoomed
-                              
-                    losses_zoomed = {}
-                    for name, pred in preds_zoomed.items():
-                        if name == 'jumping_steps' or name == 'accumulated_reward':
-                            loss = -pred.log_prob(data_zoomed[name])
-                            loss *= is_calculated_mask
-                            if loss.shape[1] != 1:
-                                loss = loss.mean(dim=1, keepdim=True)
-                            assert loss.shape == embed_zoomed.shape[:2], (name, loss.shape)
-                            losses_zoomed[name] = loss
-                            
-                        else:
-                            loss = -pred.log_prob(data_zoomed[name])
-                            if loss.shape[1] != 1:
-                                loss = loss.mean(dim=1, keepdim=True)
-                            assert loss.shape == embed_zoomed.shape[:2], (name, loss.shape)
-                            losses_zoomed[name] = loss
-                        
-                    scaled_zoomed = {
-                        key: value * self._scales.get(key, 1.0)
-                        for key, value in losses_zoomed.items()
-                    }
-                '''
-                '''
-                if zoomed_num > 0:
-                    kl_loss_img = kl_loss_img.reshape(-1, *kl_loss_img.shape[2:])
-                    kl_loss_jmp = kl_loss_jmp.reshape(-1, *kl_loss_jmp.shape[2:])
-                    kl_loss = torch.cat((kl_loss_img, kl_loss_jmp), dim=0)
-
-                    kl_value_img = kl_value_img.reshape(-1, *kl_value_img.shape[2:])
-                    kl_value_jmp = kl_value_jmp.reshape(-1, *kl_value_jmp.shape[2:])
-                    kl_value = torch.cat((kl_value_img, kl_value_jmp), dim=0)
-
-                    dyn_loss_img = dyn_loss_img.reshape(-1, *dyn_loss_img.shape[2:])
-                    dyn_loss_jmp = dyn_loss_jmp.reshape(-1, *dyn_loss_jmp.shape[2:])
-                    dyn_loss = torch.cat((dyn_loss_img, dyn_loss_jmp), dim=0)
-
-                    rep_loss_img = rep_loss_img.reshape(-1, *rep_loss_img.shape[2:])
-                    rep_loss_jmp = rep_loss_jmp.reshape(-1, *rep_loss_jmp.shape[2:])
-                    rep_loss = torch.cat((rep_loss_img, rep_loss_jmp), dim=0)
-
-                    scaled_img = sum(scaled.values()).reshape(-1, *sum(scaled.values()).shape[2:]) # [512]
-                    scaled_jmp = sum(scaled_zoomed.values()).reshape(-1, *sum(scaled_zoomed.values()).shape[2:]) # [N]
-                    scaled_sum = torch.cat((scaled_img, scaled_jmp * self._config.long_term_branch_weight), dim=0) # [512 + N]
-                    
-                    model_loss = scaled_sum + kl_loss
-                
-                else:
-                '''
                 kl_loss = kl_loss_img
                 kl_value = kl_value_img
                 dyn_loss = dyn_loss_img
                 rep_loss = rep_loss_img
-                    
-                model_loss = sum(scaled.values()) + kl_loss
+                '''
+                #CORE1
+                model_loss = sum(scaled.values()) + kl_loss_s + kl_loss_d
+                #model_loss = sum(scaled.values()) + kl_loss
 
+            #CORE1
             metrics = self._model_opt(torch.mean(model_loss), self.parameters())
+            #metrics = self._model_opt(torch.mean(model_loss), self.parameters())
 
+        # 指标上报
         metrics.update({f"{name}_loss": to_np(torch.mean(loss)) for name, loss in losses.items()})
+        #CORE1
+        # --- 信号分支 (Signal) 核心指标 ---
+        metrics.update({
+            "kl_s": to_np(torch.mean(kl_val_s)),
+            "dyn_loss_s": to_np(torch.mean(dyn_loss_s)),
+            "rep_loss_s": to_np(torch.mean(rep_loss_s)),
+            "post_ent_s": to_np(torch.mean(self.dynamics_s.get_dist(post_s).entropy())),
+            "prior_ent_s": to_np(torch.mean(self.dynamics_s.get_dist(prior_s).entropy())),
+        })
 
+        # --- 干扰分支 (Distractor) 核心指标 ---
+        # 监控干扰分支是为了确保它确实在捕获“无关噪声”
+        metrics.update({
+            "kl_d": to_np(torch.mean(kl_val_d)),
+            "dyn_loss_d": to_np(torch.mean(dyn_loss_d)),
+            "rep_loss_d": to_np(torch.mean(rep_loss_d)),
+            "post_ent_d": to_np(torch.mean(self.dynamics_d.get_dist(post_d).entropy())),
+            "prior_ent_d": to_np(torch.mean(self.dynamics_d.get_dist(prior_d).entropy())),
+        }) 
+        #CORE1
+
+        metrics["model_loss"] = to_np(torch.mean(model_loss))       
         '''
         if zoomed_num > 0:
             metrics.update({f"zoomed_{name}_loss": to_np(torch.mean(loss)) for name, loss in losses_zoomed.items()})
@@ -404,9 +425,11 @@ class WorldModel(nn.Module):
         #metrics["kl_free"] = kl_free
         #metrics["dyn_scale"] = dyn_scale
         #metrics["rep_scale"] = rep_scale
+        '''
         metrics["dyn_loss"] = to_np(torch.mean(dyn_loss))
         metrics["rep_loss"] = to_np(torch.mean(rep_loss))
         metrics["kl"] = to_np(torch.mean(kl_value))
+        '''
         '''
         if zoomed_num > 0:
             metrics["dyn_loss_img"] = to_np(torch.mean(dyn_loss_img))
@@ -414,8 +437,8 @@ class WorldModel(nn.Module):
             metrics["rep_loss_img"] = to_np(torch.mean(rep_loss_img))
             metrics["rep_loss_jmp"] = to_np(torch.mean(rep_loss_jmp))
         '''
-        metrics["model_loss"] = to_np(torch.mean(model_loss))
-
+        
+        """
         with torch.cuda.amp.autocast(self._use_amp):
             metrics["prior_ent"] = to_np(
                 torch.mean(self.dynamics.get_dist(prior).entropy())
@@ -446,7 +469,15 @@ class WorldModel(nn.Module):
             return post, post_zoomed, context, metrics
         else:
         '''
-        return post, context, metrics
+        """
+        # context 仅返回信号分支，供后续策略学习(ImagBehavior)使用
+        context = dict(
+            embed=embed_s,
+            feat=feat_s,
+            kl=kl_val_s,
+            postent=self.dynamics_s.get_dist(post_s).entropy(),
+        )       
+        return post_s, context, metrics
 
     # this function is called during both rollout and training
     def preprocess(self, obs):

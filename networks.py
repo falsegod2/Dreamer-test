@@ -509,14 +509,18 @@ class MultiEncoder(nn.Module):
             )
             self.outdim += mlp_units
 
-    def forward(self, obs):
+    def forward(self, obs, coremask=None):
         outputs = []
         if self.cnn_shapes:
             inputs = torch.cat([obs[k] for k in self.cnn_shapes], -1)
-            outputs.append(self._cnn(inputs))
+            #CORE1
+            #outputs.append(self._cnn(inputs))
+            outputs.append(self._cnn(inputs, coremask=coremask))
+        '''
         if self.mlp_shapes:
             inputs = torch.cat([obs[k] for k in self.mlp_shapes], -1)
             outputs.append(self._mlp(inputs))
+        '''
         outputs = torch.cat(outputs, -1)
         return outputs
 
@@ -645,13 +649,27 @@ class ConvEncoder(nn.Module):
         self.layers = nn.Sequential(*layers)
         self.layers.apply(tools.weight_init)
 
-    def forward(self, obs):
+    def forward(self, obs, coremask=None): #CORE1
         obs -= 0.5
         # (batch, time, h, w, ch) -> (batch * time, h, w, ch)
         x = obs.reshape((-1,) + tuple(obs.shape[-3:]))
         # (batch * time, h, w, ch) -> (batch * time, ch, h, w)
         x = x.permute(0, 3, 1, 2)
-        x = self.layers(x)
+        #x = self.layers(x)
+
+        #CORE1
+        # 逐层提取特征，以便在特定分辨率介入掩码
+        # 假设 self.layers 是一个 Sequential，包含多层卷积
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            # 在特征图缩放到 16x16 或 8x8 时介入
+            if coremask is not None and x.shape[-1] == 16: 
+                b_t = x.shape[0]
+                # 对齐 Mask 尺寸 (B*T, 1, 16, 16)
+                m = F.interpolate(coremask.view(-1, 1, coremask.shape[-2], coremask.shape[-1]), 
+                                  size=(16, 16), mode='bilinear', align_corners=False)
+                x = x * m
+
         # (batch * time, ...) -> (batch * time, -1)
         x = x.reshape([x.shape[0], np.prod(x.shape[1:])])
         # (batch * time, -1) -> (batch, time, -1)
