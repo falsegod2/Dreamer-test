@@ -877,7 +877,7 @@ def simulate(
     cache, 
     directory, 
     logger, 
-    #step_calculator,
+    step_calculator,
     max_steps,
     gamma,
     is_eval=False,
@@ -919,7 +919,7 @@ def simulate(
             # 找出需要重置的环境索引
             indices = [index for index, d in enumerate(done) if d]
             # 如果是评估模式，或者该环境确实已经结束 (real_done)
-            #indices = [index for index in indices if information[index].get("real_done", True)]
+            indices = [index for index in indices if information[index].get("real_done", True)]
             
             # 执行 Reset
             if indices:
@@ -939,12 +939,12 @@ def simulate(
                     
                     # 将初始状态写入 Cache
                     add_to_cache(cache, envs[index].id, t)
-                    '''
+                    
                     # 如果初始状态就有 Zoomed Score，记录下来
                     current_step = 0
                     if t.get("is_zoomed", False):
                         step_calculator.add(envs[index].id, current_step, t["score_on_zoomed"])
-                    '''
+                    
                     obs[index] = result
 
         # --- 2. Agent 决策 (Action) ---
@@ -1005,7 +1005,7 @@ def simulate(
             # LS-Imagine 逻辑：计算 Jumping Steps 和 Accumulated Reward
             ep_len = len(cache[env.id]["reward"])
             current_step_idx = ep_len - 1
-            '''
+            
             if transition.get("is_zoomed", False) and not d:
                 step_calculator.add(env.id, current_step_idx, transition["score_on_zoomed"])
 
@@ -1029,22 +1029,22 @@ def simulate(
             # 如果数据对处理完了，标记 real_done
             if step_calculator.count_data_pairs(env.id) == 0:
                 information[i]['real_done'] = True
-            '''
+            
         # --- 5. 回合结束处理 (Episode End) ---
         if done.any():
             indices = [index for index, d in enumerate(done) if d]
             for i in indices:
-                '''
+                
                 # 只有在真正结束时才保存 (除非是 Eval 模式)
                 if (not is_eval) and (not information[i].get("real_done", False)):
                     continue
-                '''
+                
                 # 保存 Episode 到磁盘
                 save_episodes(directory, {envs[i].id: cache[envs[i].id]})
-                '''
+                
                 # 清理临时存储
                 step_calculator.remove_all(envs[i].id)
-                '''
+                
                 # 计算统计数据
                 ep_len = len(cache[envs[i].id]["reward"]) - 1
                 ep_rew = float(np.array(cache[envs[i].id]["reward"])[:max_steps+1].sum())

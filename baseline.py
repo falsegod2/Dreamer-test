@@ -2,87 +2,128 @@ import json
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
+import os
 
-# 1. 读取数据
-data = []
-file_path = './load_metric/metrics_seed2_11_26_16_29.jsonl'  # 你的文件路径
+# --- 配置部分 ---
+# 这里填写你的日志文件名
+FILE_PATH = './load_metric/no-drive.jsonl' 
+# 如果你有另一个对比文件（比如提供的 iso_12_8），可以填在这里，否则设为 None
+FILE_PATH_2 = './load_metric/metrics2.jsonl' 
 
-try:
+# 平滑系数 (0~1)，越大越平滑，论文图中通常设为 0.6 到 0.99
+SMOOTH_FACTOR = 0.99  
+
+def load_data(file_path):
+    """
+    读取 jsonl 文件并提取 eval_return, eval_success, eval_length
+    """
+    data_list = []
+    
+    if not os.path.exists(file_path):
+        print(f"错误: 找不到文件 {file_path}")
+        return pd.DataFrame()
+
     with open(file_path, 'r') as f:
         for line in f:
             try:
-                data.append(json.loads(line))
-            except:
-                pass
-except FileNotFoundError:
-    print(f"错误：找不到文件 {file_path}")
-    # 为了演示，生成一些假数据 (如果文件不存在)
-    # 实际运行时请确保 metrics.jsonl 存在
-    pass
+                entry = json.loads(line)
+                # 我们只关心包含评估数据 (eval_success) 的行
+                if 'train_success' in entry:
+                    data_list.append({
+                        'step': entry['step'],
+                        'success': entry['train_success'],
+                        'length': entry['train_first_success_step']
+                    })
+            except json.JSONDecodeError:
+                continue
+    
+    df = pd.DataFrame(data_list)
+    return df
 
-df = pd.DataFrame(data)
+def smooth_curve(points, factor=0.9):
+    """
+    使用指数移动平均 (EMA) 进行平滑，让曲线更好看（类似 TensorBoard）
+    """
+    smoothed_points = []
+    for point in points:
+        if smoothed_points:
+            previous = smoothed_points[-1]
+            smoothed_points.append(previous * factor + point * (1 - factor))
+        else:
+            smoothed_points.append(point)
+    return smoothed_points
 
-# 2. 提取关键指标：Step 和 Train Length
-# LS-Imagine 的红色曲线对应的是你的 train_length
-if 'train_length' in df.columns:
-    plot_df = df[['step', 'train_length']].dropna()
+def plot_metrics(df_dict):
+    """
+    绘制对比图
+    """
+    # 设置画图风格
+    plt.style.use('seaborn-v0_8-whitegrid')
     
-    # 3. 数据平滑处理 (模拟论文风格)
-    # 论文中的曲线非常平滑，通常是多组 Seed 的平均，或者单 Seed 的大窗口滑动平均
-    window_size = 50  # 窗口越大曲线越平滑，阴影带越宽
-    
-    # 计算滑动平均值 (实线)
-    plot_df['mean'] = plot_df['train_length'].rolling(window=window_size, min_periods=1).mean()
-    
-    # 计算滑动标准差 (阴影范围)
-    plot_df['std'] = plot_df['train_length'].rolling(window=window_size, min_periods=1).std()
-    
-    # 4. 开始画图
-    plt.figure(figsize=(8, 6))
-    
-    # 设置风格，模仿论文背景
-    plt.style.use('seaborn-v0_8-whitegrid') # 如果报错，可用 'ggplot' 或删掉这行
-    
-    # 绘制阴影区域 (Mean ± Std)
-    plt.fill_between(
-        plot_df['step'], 
-        plot_df['mean'] - plot_df['std'], 
-        plot_df['mean'] + plot_df['std'], 
-        color='red', 
-        alpha=0.2, # 透明度，越小越淡
-        label='Variance (Std Dev)'
-    )
-    
-    # 绘制主曲线 (Mean)
-    plt.plot(
-        plot_df['step'], 
-        plot_df['mean'], 
-        color='red', 
-        linewidth=2, 
-        label='LS-Imagine (Ours)'
-    )
+    # 创建一个包含 2 个子图的画布
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
 
-    # 绘制最大步数参考线 (通常是 1000)
-    plt.axhline(y=1000, color='gray', linestyle='--', alpha=0.5, label='Max Steps')
+    colors = ['#d62728', '#1f77b4'] # 红色 (LS-Imagine 常用色), 蓝色
+    
+    for idx, (label, df) in enumerate(df_dict.items()):
+        if df.empty:
+            continue
+            
+        steps = df['step']
+        success = smooth_curve(df['success'], SMOOTH_FACTOR)
+        length = smooth_curve(df['length'], SMOOTH_FACTOR)
+        
+        color = colors[idx % len(colors)]
 
-    # 5. 设置图表标签和范围
-    plt.title('(a) Harvest log in plains', fontsize=14, y=-0.2) # 模仿论文标题位置
-    plt.xlabel('Environment steps', fontsize=12)
-    plt.ylabel('Steps per episode', fontsize=12)
-    
-    # 设置 X 轴刻度显示为 1e5 或 1e6 格式
-    plt.ticklabel_format(style='sci', axis='x', scilimits=(0,0))
-    
-    # 设置 Y 轴范围 (根据你的最大步数，一般是 0 到 1000+一点点)
-    plt.ylim(0, 1050)
-    
-    plt.legend(loc='upper right')
+        # --- 图 1: Success Rate (成功率) ---
+        ax1.plot(steps, success, label=label, color=color, linewidth=2)
+        # 如果你想模拟论文中的阴影（标准差），因为只有一个种子(seed)，我们可以用虚线画原始数据
+        ax1.plot(steps, df['success'], color=color, alpha=0.2, linewidth=1) 
+
+        # --- 图 2: Steps per episode (每回合步数) ---
+        ax2.plot(steps, length, label=label, color=color, linewidth=2)
+        ax2.plot(steps, df['length'], color=color, alpha=0.2, linewidth=1)
+
+    # --- 设置图 1 属性 ---
+    ax1.set_title('Success Rate', fontsize=16, fontweight='bold')
+    ax1.set_xlabel('Environment Steps', fontsize=14)
+    ax1.set_ylabel('Success Rate', fontsize=14)
+    ax1.set_ylim(-0.05, 1.05) # 成功率通常在 0 到 1 之间
+    ax1.ticklabel_format(style='sci', axis='x', scilimits=(0,0)) # X轴用科学计数法
+    ax1.legend(fontsize=12)
+    ax1.grid(True, linestyle='--', alpha=0.7)
+
+    # --- 设置图 2 属性 ---
+    ax2.set_title('Steps per Episode', fontsize=16, fontweight='bold')
+    ax2.set_xlabel('Environment Steps', fontsize=14)
+    ax2.set_ylabel('Steps', fontsize=14)
+    ax2.ticklabel_format(style='sci', axis='x', scilimits=(0,0))
+    ax2.legend(fontsize=12)
+    ax2.grid(True, linestyle='--', alpha=0.7)
+
     plt.tight_layout()
-    
-    # 保存并显示
-    plt.savefig('figure_5_style_plot.png', dpi=300)
+    plt.savefig('ls_imagine_metrics.png', dpi=300) # 保存为高清图片
+    print("绘图完成！图片已保存为 ls_imagine_metrics.png")
     plt.show()
-    print("图表已生成：figure_5_style_plot.png")
+
+# --- 主程序执行 ---
+if __name__ == "__main__":
+    # 1. 加载数据
+    df1 = load_data(FILE_PATH)
+    df2 = load_data(FILE_PATH_2) if FILE_PATH_2 else pd.DataFrame()
+
+    data_to_plot = {}
     
-else:
-    print("数据中未找到 'train_length' 列，无法绘图。")
+    if not df1.empty:
+        data_to_plot['LS-Imagine (Seed 0)'] = df1
+        print(f"加载了 {len(df1)} 条评估数据 (文件1)")
+    
+    if not df2.empty:
+        data_to_plot['LS-Imagine (ISO)'] = df2
+        print(f"加载了 {len(df2)} 条评估数据 (文件2)")
+
+    # 2. 开始画图
+    if data_to_plot:
+        plot_metrics(data_to_plot)
+    else:
+        print("没有加载到有效数据，请检查文件名或文件内容。")

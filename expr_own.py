@@ -271,7 +271,7 @@ def main(config):
     # --- 动作空间配置 ---
     acts = train_envs[0].action_space
     config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
-    #step_calculator = tool_own.ScoreStorage(max_steps=config.episode_max_steps)
+    step_calculator = tool_own.ScoreStorage(max_steps=config.episode_max_steps)
     state = None
     """
     3. 预填充 Replay Buffer (Prefill Phase)
@@ -305,7 +305,7 @@ def main(config):
             train_eps,
             config.traindir,
             logger,
-            #step_calculator,
+            step_calculator,
             config.episode_max_steps,
             config.discount,
             limit=config.dataset_size,
@@ -359,7 +359,7 @@ def main(config):
                 eval_eps,
                 config.evaldir,
                 logger,
-                #step_calculator,
+                step_calculator,
                 config.episode_max_steps,
                 config.discount,
                 is_eval=True,
@@ -379,7 +379,7 @@ def main(config):
             train_eps,
             config.traindir,
             logger,
-            #step_calculator,
+            step_calculator,
             config.episode_max_steps,
             config.discount,
             limit=config.dataset_size,
