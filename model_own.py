@@ -130,6 +130,7 @@ class MCUnet(nn.Module):
 
 
 class MCUnetConfig:
+    #unet配置
     class AUG:
         AUTO_AUGMENT = "rand-m9-mstd0.5-inc1"
         COLOR_JITTER = 0.4
@@ -161,7 +162,7 @@ class MCUnetConfig:
         LABEL_SMOOTHING = 0.1
         NAME = "swin_tiny_patch4_window7_224"
         NUM_CLASSES = 1000
-        PRETRAIN_CKPT = ""
+        PRETRAIN_CKPT = "./pretrained_ckpt/swin_tiny_patch4_window7_224.pth"
         RESUME = ""
         SWIN = type('SWIN', (), {
             'APE': False,
@@ -180,6 +181,42 @@ class MCUnetConfig:
         })
         TEXT_FEATURE_DIM = 512
         TYPE = "swin"
+
+    class TRAIN:
+        ACCUMULATION_STEPS = 0
+        AUTO_RESUME = True
+        BASE_LR = 0.0005
+        CLIP_GRAD = 5.0
+        EPOCHS = 300
+        LR_SCHEDULER = type('LR_SCHEDULER', (), {
+            'DECAY_EPOCHS': 30,
+            'DECAY_RATE': 0.1,
+            'NAME': "cosine"
+        })
+        MIN_LR = 5e-06
+        OPTIMIZER = type('OPTIMIZER', (), {
+            'BETAS': (0.9, 0.999),
+            'EPS': 1e-08,
+            'MOMENTUM': 0.9,
+            'NAME': "adamw"
+        })
+        START_EPOCH = 0
+        USE_CHECKPOINT = False
+        WARMUP_EPOCHS = 20
+        WARMUP_LR = 5e-07
+        WEIGHT_DECAY = 0.05
+
+    EVAL_MODE = True
+    LOCAL_RANK = 0
+    OUTPUT = ""
+    PRINT_FREQ = 10
+    SAVE_FREQ = 1
+    SEED = 0
+    TAG = "default"
+    TEST = type('TEST', (), {
+        'CROP': True
+    })
+    THROUGHPUT_MODE = False
 
 
 
@@ -213,16 +250,15 @@ class WorldModel(nn.Module):
         #CORE1
         # --- MCUnet 加载部分 ---
         # 使用本地定义的 MCUnetConfig 避开 yacs 依赖
-        self.mc_unet = MCUnet(MCUnetConfig, img_size=224, num_classes=1).to(config.device)
 
-        # 加载你训练好的模型权重
-        unet_ckpt = os.path.join("affordance_map/finetune_unet/finetune_checkpoints/harvest_log_in_plains", 'swin_unet_checkpoint.pth')
-        if os.path.exists(unet_ckpt):
-            self.mc_unet.load_state_dict(torch.load(unet_ckpt, map_location=config.device))
-            print(f"Successfully loaded MCUnet from {unet_ckpt}")
-        else:
-            print(f"Warning: MCUnet checkpoint not found at {unet_ckpt}!")
+
+        self.mc_unet = MCUnet(MCUnetConfig, img_size=224, num_classes=1).cuda()
+        snapshot = os.path.join("affordance_map/finetune_unet/finetune_checkpoints/harvest_log_in_plains", 'swin_unet_checkpoint.pth')
+        msg = self.unet.load_state_dict(torch.load(snapshot))
+        print("self trained swin unet",msg)
+        print(f"Successfully loaded MCUnet from {snapshot}")
         self.mc_unet.eval()
+
 
         # 2. 定义双分支动力学
         # 信号分支：任务相关，受控
