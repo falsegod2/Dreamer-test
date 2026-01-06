@@ -192,6 +192,7 @@ class WorldModel(nn.Module):
             name="End",
         )
 
+        '''
         self.heads["intrinsic"] = networks.MLP(
             feat_size,
             (255,) if config.intrinsic_head["dist"] == "symlog_disc" else (),
@@ -204,7 +205,7 @@ class WorldModel(nn.Module):
             device=config.device,
             name="Intrinsic",
         )
-
+        '''
         for name in config.grad_heads:
             assert name in self.heads, name
 
@@ -227,7 +228,7 @@ class WorldModel(nn.Module):
         self._scales = dict(
             reward=config.reward_head["loss_scale"],
             end=config.end_head["loss_scale"],
-            intrinsic=config.intrinsic_head["loss_scale"],
+            #intrinsic=config.intrinsic_head["loss_scale"],
         )
 
     def _train(self, data_origin):
@@ -609,7 +610,7 @@ class ImagBehavior(nn.Module):
         start,
         #start_zoomed,
         objective,
-        intrinsic_objective,
+        #intrinsic_objective,
         #jumping_steps_predictor,
         #accumulated_reward_predictor,
         #jump_indicator,
@@ -741,10 +742,10 @@ class ImagBehavior(nn.Module):
                 imagination_num_tensor = torch.tensor(state_num, dtype=torch.float32, device=imag_feat.device)
                 
                 reward = objective(imag_feat, imag_state, imag_action)
-                
+                '''
                 intrinsic_reward = intrinsic_objective(imag_feat, imag_state, imag_action)
                 reward += intrinsic_reward
-
+                '''
 
                 actor_ent = self.actor(imag_feat).entropy() 
                 state_ent = self._world_model.dynamics.get_dist(imag_state).entropy()

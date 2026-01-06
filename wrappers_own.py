@@ -197,7 +197,7 @@ class MinedojoTerminalWrapper(Wrapper):
         self.t += 1
 
         #用来区分“真正的结束”（如死亡、成功）和“人为的结束”（如超时）
-        info['real_done'] = False
+        #info['real_done'] = False
 
         #超时检查
         if self.t >= self.curr_max_steps:
@@ -209,7 +209,7 @@ class MinedojoTerminalWrapper(Wrapper):
         if self.on_death:
             if self._check_condition("death", {}, obs):
                 done = True
-                info['real_done'] = True
+                #info['real_done'] = True
 
 
         if len(self.all_conditions) > 0:
@@ -218,7 +218,7 @@ class MinedojoTerminalWrapper(Wrapper):
                 for condition_type, condition_info in self.all_conditions.items()
             ):
                 done = True
-                info['real_done'] = True
+                #info['real_done'] = True
 
         if len(self.any_conditions) > 0:
             if any(
@@ -226,7 +226,7 @@ class MinedojoTerminalWrapper(Wrapper):
                 for condition_type, condition_info in self.any_conditions.items()
             ):
                 done = True
-                info['real_done'] = True
+                #info['real_done'] = True
 
         return obs, reward, done, info
 
@@ -700,7 +700,8 @@ class MinedojoLSImagineWrapper(Wrapper):
                 break
         obs["is_first"] = False
         obs["is_last"] = bool(done)
-        obs["is_terminal"] = bool(info.get("is_terminal", info["real_done"]))
+        #obs["is_terminal"] = bool(info.get("is_terminal", info["real_done"]))
+        obs["is_terminal"] = bool(done)
         obs = self._obs(obs)
 
         assert "pov" not in obs, list(obs.keys())

@@ -121,16 +121,16 @@ class LS_Imagine(nn.Module):
         reward = lambda f, s, a: self._wm.heads["reward"](
             self._wm.dynamics.get_feat(s)
         ).mode()
-
+        '''
         intrinsic = lambda f, s, a: self._wm.heads["intrinsic"](
             self._wm.dynamics.get_feat(s)
         ).mode() 
-
+        '''
         is_end = lambda s: self._wm.heads["end"](
             self._wm.dynamics.get_feat(s)
         ).mean
 
-        metrics.update(self._task_behavior._train(post, reward, intrinsic, is_end)[-1])
+        metrics.update(self._task_behavior._train(post, reward, is_end)[-1])
         if self._config.expl_behavior != "greedy":
             mets = self._expl_behavior.train(post, context, data)[-1]
             metrics.update({"expl_" + key: value for key, value in mets.items()})
@@ -271,7 +271,7 @@ def main(config):
     # --- 动作空间配置 ---
     acts = train_envs[0].action_space
     config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
-    step_calculator = tool_own.ScoreStorage(max_steps=config.episode_max_steps)
+    #step_calculator = tool_own.ScoreStorage(max_steps=config.episode_max_steps)
     state = None
     """
     3. 预填充 Replay Buffer (Prefill Phase)
@@ -305,7 +305,7 @@ def main(config):
             train_eps,
             config.traindir,
             logger,
-            step_calculator,
+            #step_calculator,
             config.episode_max_steps,
             config.discount,
             limit=config.dataset_size,
@@ -359,7 +359,7 @@ def main(config):
                 eval_eps,
                 config.evaldir,
                 logger,
-                step_calculator,
+                #step_calculator,
                 config.episode_max_steps,
                 config.discount,
                 is_eval=True,
@@ -379,7 +379,7 @@ def main(config):
             train_eps,
             config.traindir,
             logger,
-            step_calculator,
+            #step_calculator,
             config.episode_max_steps,
             config.discount,
             limit=config.dataset_size,
