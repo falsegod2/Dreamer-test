@@ -47,7 +47,7 @@ defaults:
   dyn_std_act: 'sigmoid2'
   dyn_min_std: 0.1
   #grad_heads: ['decoder', 'reward', 'end', 'intrinsic', 'jump', 'jumping_steps', 'accumulated_reward']
-  grad_heads: ['decoder', 'reward', 'end', 'intrinsic']
+  grad_heads: ['decoder', 'reward', 'end']
   units: 512
   act: 'SiLU'
   norm: True
