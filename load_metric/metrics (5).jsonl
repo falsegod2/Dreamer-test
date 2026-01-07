@@ -1,0 +1,2 @@
+{"step": 0, "dataset_size": 1000.0, "train_return": 0.0, "train_length": 1000.0, "train_episodes": 1.0, "train_success": 0.0, "train_first_success_step": 1000.0}
+{"step": 0, "dataset_size": 2000.0, "train_return": 0.0, "train_length": 1000.0, "train_episodes": 2.0, "train_success": 0.0, "train_first_success_step": 1000.0}

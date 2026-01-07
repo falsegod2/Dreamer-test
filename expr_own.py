@@ -25,7 +25,7 @@ sys.path.append(str(pathlib.Path(__file__).parent))
 to_np = lambda x: x.detach().cpu().numpy()
 
 class LS_Imagine(nn.Module):
-    def __init__(self, obs_space, act_space, config, logger, dataset):
+    def __init__(self, obs_space, act_space, config, logger, dataset, env):
         super(LS_Imagine, self).__init__()
         self._config = config
         self._logger = logger
@@ -39,8 +39,15 @@ class LS_Imagine(nn.Module):
         self._step = logger.step // config.action_repeat
         self._update_count = 0
         self._dataset = dataset
-        self._wm = model_own.WorldModel(obs_space, act_space, self._step, config)
+
+        #CORE1
+        self.env = env
+
+        self._wm = model_own.WorldModel(obs_space, act_space, self._step, config, self.env)
         self._task_behavior = model_own.ImagBehavior(config, self._wm)
+
+
+
         if (
             config.compile and os.name != "nt"
         ):  # compilation is not supported on windows
@@ -316,6 +323,7 @@ def main(config):
         logger.step += prefill * config.action_repeat
         print(f"Logger: ({logger.step} steps).")
 
+
     """
     4. Agent 初始化 (Agent Initialization)
     """
@@ -330,6 +338,7 @@ def main(config):
         config,
         logger,
         train_dataset,
+        train_envs,
     ).to(config.device)
 
     agent.requires_grad_(requires_grad=False)

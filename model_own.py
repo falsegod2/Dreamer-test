@@ -23,6 +23,9 @@ from affordance_map.networks.swin_transformer_unet_skip_expand_decoder_sys impor
 import networks
 import tools
 
+#from mineclip import MineCLIP
+
+
 logger = logging.getLogger(__name__)
 to_np = lambda x: x.detach().cpu().numpy()
 
@@ -221,7 +224,7 @@ class MCUnetConfig:
 
 
 class WorldModel(nn.Module):
-    def __init__(self, obs_space, act_space, step, config):
+    def __init__(self, obs_space, act_space, step, config, env):
         super(WorldModel, self).__init__()
         self._use_amp = True if config.precision == 16 else False
         self._config = config
@@ -250,7 +253,10 @@ class WorldModel(nn.Module):
         #CORE1
         # --- MCUnet 加载部分 ---
         # 使用本地定义的 MCUnetConfig 避开 yacs 依赖
+        self.env = env
 
+        prompt = ["Cut a tree"]
+        self.prompt = env._get_text_feats(prompt)
 
         self.mc_unet = MCUnet(MCUnetConfig, img_size=224, num_classes=1).cuda()
         snapshot = os.path.join("affordance_map/finetune_unet/finetune_checkpoints/harvest_log_in_plains", 'swin_unet_checkpoint.pth')
@@ -258,6 +264,8 @@ class WorldModel(nn.Module):
         print("self trained swin unet",msg)
         print(f"Successfully loaded MCUnet from {snapshot}")
         self.mc_unet.eval()
+
+        #self.clip = MineCLIP(**config).to(self.device)
 
 
         # 2. 定义双分支动力学
@@ -362,7 +370,8 @@ class WorldModel(nn.Module):
                 # data['p'] 是任务目标文本嵌入
                 # 注意：MCUnet 输出是 [B*T, 1, 224, 224]
                 # out_mask 形状: (B*T, 1, 224, 224)
-                aff_mask_flat = self.mc_unet(data['image'], data['p']) 
+
+                aff_mask_flat = self.mc_unet(data['image'],self.prompt) 
                 # 还原维度以配合 Encoder 处理 (B, T, 1, H, W)
                 aff_mask = aff_mask_flat.reshape(
                     data['image'].shape[0], data['image'].shape[1], 1, 
